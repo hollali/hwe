@@ -1,0 +1,20 @@
+[package]
+name = "hwe-vfs"
+description = "Virtual filesystem traits and a local backend for the Hwɛ file manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["filesystem", "async", "file-manager"]
+categories = ["filesystem", "asynchronous"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

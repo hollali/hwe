@@ -1,0 +1,25 @@
+[package]
+name = "hwe"
+description = "A fast, keyboard-driven terminal file manager with live previews"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "../../README.md"
+keywords = ["file-manager", "tui", "terminal", "filesystem", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fm"
+path = "src/main.rs"
+
+[dependencies]
+hwe-core.workspace = true
+hwe-tui.workspace = true
+hwe-vfs.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

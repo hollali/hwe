@@ -1,0 +1,20 @@
+[package]
+name = "hwe-tui"
+description = "Ratatui interface for the Hwɛ file manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["tui", "terminal", "file-manager", "ratatui"]
+categories = ["command-line-interface", "command-line-utilities"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hwe-core.workspace = true
+hwe-vfs.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true

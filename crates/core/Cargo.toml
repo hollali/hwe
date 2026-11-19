@@ -1,0 +1,19 @@
+[package]
+name = "hwe-core"
+description = "Core state, commands, and event loop for the Hwɛ file manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords = ["file-manager", "tui", "terminal"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lints]
+workspace = true
+
+[dependencies]
+hwe-vfs.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

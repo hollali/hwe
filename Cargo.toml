@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/cli", "crates/core", "crates/tui", "crates/vfs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hwe-core = { version = "0.1.0", path = "crates/core" }
+hwe-tui = { version = "0.1.0", path = "crates/tui" }
+hwe-vfs = { version = "0.1.0", path = "crates/vfs" }
+
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.30"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+unicode-width = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
