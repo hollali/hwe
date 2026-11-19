@@ -90,6 +90,14 @@ impl Keymap {
         keymap.bind(Key::Char('G'), "nav.bottom");
         keymap.bind(Key::End, "nav.bottom");
         keymap.bind(Key::F(5), "app.refresh");
+        keymap.bind(Key::Char('T'), "view.theme");
+        keymap.bind(Key::Char('I'), "view.icons");
+        keymap.bind(Key::Tab, "preview.focus");
+        keymap.bind(Key::Char('?'), "app.help");
+        keymap.bind(Key::ctrl('t'), "tab.new");
+        keymap.bind(Key::ctrl('w'), "tab.close");
+        keymap.bind_sequence(&[Key::Char('g'), Key::Char('t')], "tab.next");
+        keymap.bind_sequence(&[Key::Char('g'), Key::Char('T')], "tab.previous");
         keymap.bind(Key::Char('q'), "app.quit");
         keymap.bind(Key::ctrl('c'), "app.quit");
         keymap
@@ -192,6 +200,29 @@ mod tests {
         let mut keymap = Keymap::vim();
         assert_eq!(keymap.resolve(Key::Char('z')), Resolution::Unbound);
         assert!(keymap.pending().is_empty());
+    }
+
+    #[test]
+    fn tab_keys_resolve() {
+        let mut keymap = Keymap::vim();
+        assert_eq!(
+            keymap.resolve(Key::ctrl('t')),
+            Resolution::Command("tab.new")
+        );
+        assert_eq!(
+            keymap.resolve(Key::ctrl('w')),
+            Resolution::Command("tab.close")
+        );
+        assert_eq!(keymap.resolve(Key::Char('g')), Resolution::Pending);
+        assert_eq!(
+            keymap.resolve(Key::Char('t')),
+            Resolution::Command("tab.next")
+        );
+        assert_eq!(keymap.resolve(Key::Char('g')), Resolution::Pending);
+        assert_eq!(
+            keymap.resolve(Key::Char('T')),
+            Resolution::Command("tab.previous")
+        );
     }
 
     #[test]

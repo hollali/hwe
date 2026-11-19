@@ -1,7 +1,10 @@
 mod app;
 mod navigation;
 
-pub use app::{QuitCommand, RefreshCommand};
+pub use app::{
+    CloseTabCommand, HelpCommand, IconsCommand, NewTabCommand, NextTabCommand, PreviewFocusCommand,
+    PreviousTabCommand, QuitCommand, RefreshCommand, ThemeCommand,
+};
 pub use navigation::{
     BottomCommand, DownCommand, EnterCommand, ParentCommand, TopCommand, UpCommand,
 };
@@ -17,6 +20,14 @@ pub fn registry() -> CommandRegistry {
     registry.register(TopCommand);
     registry.register(BottomCommand);
     registry.register(RefreshCommand);
+    registry.register(ThemeCommand);
+    registry.register(IconsCommand);
+    registry.register(PreviewFocusCommand);
+    registry.register(HelpCommand);
+    registry.register(NewTabCommand);
+    registry.register(CloseTabCommand);
+    registry.register(NextTabCommand);
+    registry.register(PreviousTabCommand);
     registry.register(QuitCommand);
     registry
 }

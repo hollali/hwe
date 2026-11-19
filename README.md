@@ -6,17 +6,21 @@ called **Hwɛ**; the installed binary is **`fm`**.
 Hwɛ browses directories asynchronously, renders a live preview of the selected
 entry, and keeps the UI thread free while work happens in the background.
 
-> Status: early development (`0.1.0`). The core navigation and preview
-> experience works; file-operation UI, tabs, search, and configuration files are
-> planned.
+> Status: early development (`0.1.0`). Navigation, tabs, previews, themes, and
+> the command palette work; file operations and search are planned.
 
 ## Features
 
 - Vim-style navigation (`hjkl`, arrows, `gg`/`G`) with a command-based core
+- Tabs with independent directories, loading, and previews
 - Asynchronous, cancellable directory loading and sorting
-- Live preview pane for directories, text files, and binary files
-- Truecolor Tokyo Night theme with `NO_COLOR` and `FM_ASCII` fallbacks
-- Responsive layout: the preview pane hides automatically on narrow terminals
+- Live previews for directories, text files, and binaries, with line numbers,
+  scrolling, and lightweight syntax highlighting
+- Miller columns on wide terminals: parent, current, and preview panes
+- Command palette (`:`) and keyboard help overlay (`?`)
+- Four color themes (Tokyo Night, Catppuccin, Gruvbox, Nord), truecolor/256/no-color
+  modes, and `NO_COLOR` / `FM_ASCII` fallbacks
+- Optional file-type icons (`FM_ICONS` or `I`) and permission columns on wide lists
 - Single self-contained binary with no runtime dependencies
 
 ## Install
@@ -52,8 +56,10 @@ cargo build --release -p hwe
 ## Usage
 
 ```sh
-fm          # open the current directory
-fm ~/src    # open a specific directory
+fm                      # open the current directory
+fm ~/src                # open a specific directory
+fm --theme nord ~/src   # pick a theme
+fm --color 256          # force a 256-color palette
 fm --help
 fm --version
 ```
@@ -68,6 +74,15 @@ fm --version
 | `l` / `Right` / `Enter` | Enter directory |
 | `gg` / `Home` | Go to top |
 | `G` / `End` | Go to bottom |
+| `Tab` | Focus / unfocus the preview pane |
+| `j` / `k`, `PgUp` / `PgDn` | Scroll the focused preview |
+| `Ctrl+T` | Open a new tab at the current directory |
+| `Ctrl+W` | Close the current tab |
+| `gt` / `gT` | Next / previous tab |
+| `:` | Open the command palette |
+| `?` | Toggle the keyboard help overlay |
+| `T` | Cycle color themes |
+| `I` | Toggle file-type icons |
 | `F5` | Refresh |
 | `q` / `Ctrl+C` | Quit |
 
@@ -78,8 +93,13 @@ When the terminal is at least 76 columns wide, the right pane previews the
 selected entry:
 
 - Directories: their contents, capped at 1000 entries
-- Text files: up to 400 lines or 64 KiB, with control characters sanitized
+- Text files: up to 400 lines or 64 KiB, with control characters sanitized,
+  line numbers, and syntax highlighting for common languages
 - Binary files: a size notice instead of raw bytes
+
+At 110 columns or more, a parent-directory column appears on the left, giving a
+Miller-column layout: parent, current directory, preview. Preview focus is
+indicated by the highlighted pane border; the footer shows the active keys.
 
 ### Environment
 
@@ -87,6 +107,9 @@ selected entry:
 | --- | --- |
 | `NO_COLOR` | Disable all colors |
 | `FM_ASCII` | Use ASCII glyphs instead of Unicode box drawing |
+| `FM_THEME` | `tokyo-night`, `catppuccin`, `gruvbox`, or `nord` |
+| `FM_COLOR` | `auto`, `truecolor`, `256`, or `none` |
+| `FM_ICONS` | `1`/`0` to enable or disable Nerd Font file icons |
 | `COLORTERM` / `TERM` | Detected to enable truecolor when supported |
 
 ## Development

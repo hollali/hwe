@@ -17,7 +17,7 @@ impl CommandHandler for UpCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab.move_cursor(-1) {
+        if ctx.state.tab_mut().move_cursor(-1) {
             Effect::Redraw
         } else {
             Effect::None
@@ -38,7 +38,7 @@ impl CommandHandler for DownCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab.move_cursor(1) {
+        if ctx.state.tab_mut().move_cursor(1) {
             Effect::Redraw
         } else {
             Effect::None
@@ -59,7 +59,7 @@ impl CommandHandler for TopCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab.jump_top() {
+        if ctx.state.tab_mut().jump_top() {
             Effect::Redraw
         } else {
             Effect::None
@@ -80,7 +80,7 @@ impl CommandHandler for BottomCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab.jump_bottom() {
+        if ctx.state.tab_mut().jump_bottom() {
             Effect::Redraw
         } else {
             Effect::None
@@ -101,7 +101,7 @@ impl CommandHandler for ParentCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        let current = ctx.state.tab.path.clone();
+        let current = ctx.state.tab().path.clone();
         match current.parent() {
             Some(parent) => {
                 let select = current
@@ -134,7 +134,7 @@ impl CommandHandler for EnterCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        let Some(entry) = ctx.state.tab.selected() else {
+        let Some(entry) = ctx.state.tab().selected() else {
             return Effect::None;
         };
 
@@ -169,13 +169,14 @@ mod tests {
             is_hidden: false,
             is_symlink: false,
             is_executable: false,
+            mode: None,
         }
     }
 
     fn state_with(entries: Vec<Entry>) -> AppState {
         let mut state = AppState::new(VPath::new("/tmp"));
-        state.tab.entries = entries;
-        state.tab.loading = false;
+        state.tab_mut().entries = entries;
+        state.tab_mut().loading = false;
         state
     }
 
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn parent_navigates_and_selects_previous_directory() {
         let mut state = AppState::new(VPath::new("/tmp/current"));
-        state.tab.loading = false;
+        state.tab_mut().loading = false;
         let mut ctx = CommandContext { state: &mut state };
         let effect = ParentCommand.run(&mut ctx, &Args::empty());
         match effect {
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn parent_at_root_reports_status() {
         let mut state = AppState::new(VPath::new("/"));
-        state.tab.loading = false;
+        state.tab_mut().loading = false;
         let mut ctx = CommandContext { state: &mut state };
         let effect = ParentCommand.run(&mut ctx, &Args::empty());
         assert!(matches!(effect, Effect::Redraw));

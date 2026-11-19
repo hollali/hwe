@@ -124,8 +124,8 @@ mod tests {
     fn dispatch_runs_command_and_mutates_state() {
         let registry = commands::registry();
         let mut state = AppState::new(VPath::new("/tmp"));
-        state.tab.loading = false;
-        state.tab.entries.push(crate::state::Entry {
+        state.tab_mut().loading = false;
+        state.tab_mut().entries.push(crate::state::Entry {
             name: "a".into(),
             path: VPath::new("/tmp/a"),
             kind: hwe_vfs::EntryKind::File,
@@ -134,6 +134,7 @@ mod tests {
             is_hidden: false,
             is_symlink: false,
             is_executable: false,
+            mode: None,
         });
 
         let mut ctx = CommandContext { state: &mut state };
@@ -141,6 +142,6 @@ mod tests {
             .dispatch("nav.down", &mut ctx, &Args::empty())
             .expect("command");
         assert!(matches!(effect, Effect::None));
-        assert_eq!(ctx.state.tab.cursor, 0);
+        assert_eq!(ctx.state.tab().cursor, 0);
     }
 }

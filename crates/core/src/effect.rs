@@ -5,5 +5,11 @@ pub enum Effect {
     None,
     Redraw,
     Navigate { path: VPath, select: Option<String> },
+    CycleTheme,
+    ToggleIcons,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
     Quit,
 }

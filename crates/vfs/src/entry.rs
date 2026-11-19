@@ -19,6 +19,7 @@ pub struct DirEntry {
     pub is_hidden: bool,
     pub is_symlink: bool,
     pub is_executable: bool,
+    pub mode: Option<u32>,
 }
 
 #[derive(Clone, Debug)]

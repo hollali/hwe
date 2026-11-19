@@ -17,6 +17,22 @@ use tokio::sync::mpsc;
 struct Cli {
     #[arg(value_name = "PATH", default_value = ".")]
     path: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "THEME",
+        value_parser = ["tokyo-night", "catppuccin", "gruvbox", "nord"],
+        help = "Color theme (env: FM_THEME)"
+    )]
+    theme: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_parser = ["auto", "truecolor", "256", "none"],
+        help = "Color mode (env: FM_COLOR)"
+    )]
+    color: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -28,7 +44,7 @@ fn main() -> Result<()> {
         .build()
         .context("failed to start the async runtime")?;
 
-    runtime.block_on(run(start))
+    runtime.block_on(run(start, cli.theme.as_deref(), cli.color.as_deref()))
 }
 
 fn resolve_start(path: &Path) -> Result<VPath> {
@@ -51,10 +67,11 @@ fn resolve_start(path: &Path) -> Result<VPath> {
     Ok(VPath::new(canonical))
 }
 
-async fn run(start: VPath) -> Result<()> {
+async fn run(start: VPath, theme: Option<&str>, color: Option<&str>) -> Result<()> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
 
-    let mut renderer = TuiRenderer::new().context("failed to initialize the terminal")?;
+    let mut renderer =
+        TuiRenderer::with_options(theme, color).context("failed to initialize the terminal")?;
     let _input = spawn_input(events_tx);
 
     let app = App::new(Arc::new(LocalFs::new()), start, events_rx);

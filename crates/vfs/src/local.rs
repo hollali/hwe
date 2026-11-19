@@ -46,6 +46,13 @@ fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
     };
     #[cfg(not(unix))]
     let is_executable = false;
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.as_ref().map(|meta| meta.mode())
+    };
+    #[cfg(not(unix))]
+    let mode = None;
 
     let modified = metadata.and_then(|metadata| metadata.modified().ok());
     let is_hidden = name.starts_with('.');
@@ -59,6 +66,7 @@ fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
         is_hidden,
         is_symlink,
         is_executable,
+        mode,
     })
 }
 

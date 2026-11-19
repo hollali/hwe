@@ -30,6 +30,7 @@ pub struct Entry {
     pub is_hidden: bool,
     pub is_symlink: bool,
     pub is_executable: bool,
+    pub mode: Option<u32>,
 }
 
 impl From<VfsDirEntry> for Entry {
@@ -43,12 +44,15 @@ impl From<VfsDirEntry> for Entry {
             is_hidden: entry.is_hidden,
             is_symlink: entry.is_symlink,
             is_executable: entry.is_executable,
+            mode: entry.mode,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct TabState {
+    pub id: u64,
+    pub load_id: u64,
     pub path: VPath,
     pub entries: Vec<Entry>,
     pub cursor: usize,
@@ -59,6 +63,8 @@ pub struct TabState {
 impl TabState {
     pub fn new(path: VPath) -> Self {
         Self {
+            id: 0,
+            load_id: 0,
             path,
             entries: Vec::new(),
             cursor: 0,
@@ -135,24 +141,112 @@ pub enum Preview {
 pub struct PreviewState {
     pub path: Option<VPath>,
     pub content: Preview,
+    pub scroll: usize,
+    pub focus: bool,
+}
+
+impl PreviewState {
+    pub fn content_len(&self) -> usize {
+        match &self.content {
+            Preview::Directory { entries, .. } => entries.len(),
+            Preview::Text { lines, .. } => lines.len(),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ParentState {
+    pub path: Option<VPath>,
+    pub entries: Vec<Entry>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaletteMatch {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PaletteState {
+    pub query: String,
+    pub selected: usize,
+    pub matches: Vec<PaletteMatch>,
 }
 
 #[derive(Debug)]
 pub struct AppState {
-    pub tab: TabState,
+    pub tabs: Vec<TabState>,
+    pub active: usize,
     pub status: Option<StatusMessage>,
     pub pending_keys: Vec<Key>,
     pub preview: PreviewState,
+    pub parent: ParentState,
+    pub help: bool,
+    pub palette: Option<PaletteState>,
 }
 
 impl AppState {
     pub fn new(path: VPath) -> Self {
+        let mut tab = TabState::new(path);
+        tab.id = 1;
         Self {
-            tab: TabState::new(path),
+            tabs: vec![tab],
+            active: 0,
             status: None,
             pending_keys: Vec::new(),
             preview: PreviewState::default(),
+            parent: ParentState::default(),
+            help: false,
+            palette: None,
         }
+    }
+
+    pub fn tab(&self) -> &TabState {
+        &self.tabs[self.active]
+    }
+
+    pub fn tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active]
+    }
+
+    pub fn tab_index(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    pub fn open_tab(&mut self) -> usize {
+        let path = self.tab().path.clone();
+        let id = self.tabs.iter().map(|tab| tab.id).max().unwrap_or(0) + 1;
+        let mut tab = TabState::new(path);
+        tab.id = id;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.active
+    }
+
+    pub fn close_active_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            return false;
+        }
+        self.tabs.remove(self.active);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        true
+    }
+
+    pub fn next_tab(&mut self) {
+        self.active = (self.active + 1) % self.tabs.len();
+    }
+
+    pub fn previous_tab(&mut self) {
+        self.active = if self.active == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.active - 1
+        };
     }
 
     pub fn set_status(&mut self, level: StatusLevel, text: impl Into<String>) {
@@ -205,6 +299,7 @@ mod tests {
             is_hidden: name.starts_with('.'),
             is_symlink: false,
             is_executable: false,
+            mode: None,
         }
     }
 
@@ -258,6 +353,28 @@ mod tests {
         assert_eq!(tab.selected().unwrap().name, "b");
         tab.clamp_cursor();
         assert_eq!(tab.cursor, 1);
+    }
+
+    #[test]
+    fn tabs_open_switch_and_close() {
+        let mut state = AppState::new(VPath::new("/tmp"));
+        assert_eq!(state.tabs.len(), 1);
+        let first = state.tab().id;
+
+        state.open_tab();
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active, 1);
+        assert_ne!(state.tab().id, first);
+
+        state.next_tab();
+        assert_eq!(state.active, 0);
+        state.previous_tab();
+        assert_eq!(state.active, 1);
+
+        assert!(state.close_active_tab());
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.active, 0);
+        assert!(!state.close_active_tab());
     }
 
     #[test]
