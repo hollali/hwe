@@ -1,11 +1,126 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime};
 
-use hwe_vfs::{DirEntry as VfsDirEntry, EntryKind, VPath};
+use hwe_vfs::{DirEntry as VfsDirEntry, EntryKind, RemoveMode, VPath};
 
 use crate::keymap::Key;
 
 pub const STATUS_TTL: Duration = Duration::from_secs(4);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Size,
+    Modified,
+    Extension,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Size => Self::Modified,
+            Self::Modified => Self::Extension,
+            Self::Extension => Self::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Modified => "modified",
+            Self::Extension => "extension",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "name" => Some(Self::Name),
+            "size" => Some(Self::Size),
+            "modified" | "date" | "time" => Some(Self::Modified),
+            "extension" | "ext" | "type" => Some(Self::Extension),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SortSettings {
+    pub mode: SortMode,
+    pub dirs_first: bool,
+    pub reverse: bool,
+}
+
+impl Default for SortSettings {
+    fn default() -> Self {
+        Self {
+            mode: SortMode::Name,
+            dirs_first: true,
+            reverse: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Settings {
+    pub show_hidden: bool,
+    pub sort: SortSettings,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConfirmAction {
+    Delete { paths: Vec<VPath>, mode: RemoveMode },
+}
+
+#[derive(Clone, Debug)]
+pub enum PromptKind {
+    Mkdir,
+    Touch,
+    Rename { target: VPath },
+    Filter,
+    Confirm { action: ConfirmAction },
+}
+
+#[derive(Clone, Debug)]
+pub struct PromptState {
+    pub kind: PromptKind,
+    pub title: String,
+    pub input: String,
+    pub hint: String,
+}
+
+impl PromptState {
+    pub fn text(kind: PromptKind, title: impl Into<String>, input: impl Into<String>) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            input: input.into(),
+            hint: "Enter confirms · Esc cancels".to_string(),
+        }
+    }
+
+    pub fn confirm(action: ConfirmAction, title: impl Into<String>) -> Self {
+        Self {
+            kind: PromptKind::Confirm { action },
+            title: title.into(),
+            input: String::new(),
+            hint: "Enter/y confirms · Esc/n cancels".to_string(),
+        }
+    }
+
+    pub fn is_confirm(&self) -> bool {
+        matches!(self.kind, PromptKind::Confirm { .. })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Clipboard {
+    pub paths: Vec<VPath>,
+    pub cut: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusLevel {
@@ -58,6 +173,8 @@ pub struct TabState {
     pub cursor: usize,
     pub loading: bool,
     pub error: Option<String>,
+    pub marks: HashSet<usize>,
+    pub filter: Option<String>,
 }
 
 impl TabState {
@@ -70,7 +187,26 @@ impl TabState {
             cursor: 0,
             loading: true,
             error: None,
+            marks: HashSet::new(),
+            filter: None,
         }
+    }
+
+    pub fn visible_entries<'a>(&'a self, settings: &'a Settings) -> Vec<&'a Entry> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                (settings.show_hidden || !entry.is_hidden)
+                    && self.filter.as_ref().is_none_or(|query| {
+                        entry
+                            .name
+                            .to_ascii_lowercase()
+                            .contains(&query.to_ascii_lowercase())
+                    })
+            })
+            .map(|(_, entry)| entry)
+            .collect()
     }
 
     pub fn selected(&self) -> Option<&Entry> {
@@ -186,6 +322,10 @@ pub struct AppState {
     pub parent: ParentState,
     pub help: bool,
     pub palette: Option<PaletteState>,
+    pub prompt: Option<PromptState>,
+    pub settings: Settings,
+    pub clipboard: Option<Clipboard>,
+    pub load_state: Option<(u64, u64)>,
 }
 
 impl AppState {
@@ -201,7 +341,15 @@ impl AppState {
             parent: ParentState::default(),
             help: false,
             palette: None,
+            prompt: None,
+            settings: Settings::default(),
+            clipboard: None,
+            load_state: None,
         }
+    }
+
+    pub fn prompt_mut(&mut self) -> Option<&mut PromptState> {
+        self.prompt.as_mut()
     }
 
     pub fn tab(&self) -> &TabState {
@@ -270,12 +418,45 @@ impl AppState {
     }
 }
 
-pub fn sort_entries(entries: &mut [Entry]) {
+pub fn sort_entries(entries: &mut [Entry], settings: SortSettings) {
     entries.sort_by(|a, b| {
-        let a_rank = u8::from(a.kind != EntryKind::Dir);
-        let b_rank = u8::from(b.kind != EntryKind::Dir);
-        a_rank.cmp(&b_rank).then_with(|| name_cmp(&a.name, &b.name))
+        if settings.dirs_first {
+            let a_rank = u8::from(a.kind != EntryKind::Dir);
+            let b_rank = u8::from(b.kind != EntryKind::Dir);
+            let rank_order = a_rank.cmp(&b_rank);
+            if rank_order != Ordering::Equal {
+                return if settings.reverse {
+                    rank_order.reverse()
+                } else {
+                    rank_order
+                };
+            }
+        }
+
+        let primary = match settings.mode {
+            SortMode::Name => name_cmp(&a.name, &b.name),
+            SortMode::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+            SortMode::Modified => a.modified.cmp(&b.modified),
+            SortMode::Extension => {
+                let a_ext = extension_of(&a.name);
+                let b_ext = extension_of(&b.name);
+                a_ext.cmp(&b_ext).then_with(|| name_cmp(&a.name, &b.name))
+            }
+        };
+
+        let ordered = if settings.reverse {
+            primary.reverse()
+        } else {
+            primary
+        };
+        ordered.then_with(|| a.name.cmp(&b.name))
     });
+}
+
+fn extension_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 fn name_cmp(a: &str, b: &str) -> Ordering {
@@ -340,7 +521,7 @@ mod tests {
             entry("Beta.txt", EntryKind::File),
             entry("beta", EntryKind::Dir),
         ];
-        sort_entries(&mut entries);
+        sort_entries(&mut entries, SortSettings::default());
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["alpha", "beta", "Beta.txt", "zeta.txt"]);
     }

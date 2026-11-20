@@ -1,5 +1,7 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -10,12 +12,167 @@ use crate::{
     VfsError,
 };
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalFs;
+#[derive(Clone, Debug, Default)]
+pub struct LocalFs {
+    trash_root: Option<PathBuf>,
+}
 
 impl LocalFs {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_trash_root(path: impl Into<PathBuf>) -> Self {
+        Self {
+            trash_root: Some(path.into()),
+        }
+    }
+
+    fn trash_root(&self) -> Option<PathBuf> {
+        if let Some(root) = &self.trash_root {
+            return Some(root.clone());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let data_home = std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+                });
+            data_home.map(|home| home.join("Trash"))
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".Trash"));
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            None
+        }
+    }
+
+    async fn remove_permanent(&self, path: &VPath) -> Result<()> {
+        let path_ref = path.as_path();
+        let metadata = tokio::fs::symlink_metadata(path_ref)
+            .await
+            .map_err(|error| VfsError::from_io(error, path_ref))?;
+        if metadata.is_dir() {
+            tokio::fs::remove_dir_all(path_ref)
+                .await
+                .map_err(|error| VfsError::from_io(error, path_ref))
+        } else {
+            tokio::fs::remove_file(path_ref)
+                .await
+                .map_err(|error| VfsError::from_io(error, path_ref))
+        }
+    }
+
+    async fn trash(&self, path: &VPath) -> Result<()> {
+        let Some(root) = self.trash_root() else {
+            return Err(VfsError::Unsupported(
+                "trash is not available on this platform",
+            ));
+        };
+
+        let path_ref = path.as_path();
+        let name = path_ref
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unnamed".to_string());
+
+        #[cfg(target_os = "linux")]
+        {
+            let files_dir = root.join("files");
+            let info_dir = root.join("info");
+            tokio::fs::create_dir_all(&files_dir)
+                .await
+                .map_err(|error| VfsError::from_io(error, &files_dir))?;
+            tokio::fs::create_dir_all(&info_dir)
+                .await
+                .map_err(|error| VfsError::from_io(error, &info_dir))?;
+
+            let mut suffix = 0u32;
+            let (destination, info_path) = loop {
+                let candidate = if suffix == 0 {
+                    name.clone()
+                } else {
+                    format!("{name}.{suffix}")
+                };
+                let destination = files_dir.join(&candidate);
+                let info_path = info_dir.join(format!("{candidate}.trashinfo"));
+                if !destination.exists() && !info_path.exists() {
+                    break (destination, info_path);
+                }
+                suffix += 1;
+            };
+
+            let source = absolute_path(path_ref);
+            move_into(&source, &destination, self).await?;
+
+            let info = format!(
+                "[Trash Info]\nPath={}\nDeletionDate={}\n",
+                source.display(),
+                utc_timestamp()
+            );
+            tokio::fs::write(&info_path, info)
+                .await
+                .map_err(|error| VfsError::from_io(error, &info_path))?;
+            Ok(())
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            tokio::fs::create_dir_all(&root)
+                .await
+                .map_err(|error| VfsError::from_io(error, &root))?;
+            let mut suffix = 0u32;
+            let destination = loop {
+                let candidate = if suffix == 0 {
+                    name.clone()
+                } else {
+                    format!("{name}.{suffix}")
+                };
+                let destination = root.join(candidate);
+                if !destination.exists() {
+                    break destination;
+                }
+                suffix += 1;
+            };
+            let source = absolute_path(path_ref);
+            move_into(&source, &destination, self).await
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (root, name);
+            Err(VfsError::Unsupported(
+                "trash is not available on this platform",
+            ))
+        }
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+async fn move_into(source: &Path, destination: &Path, backend: &LocalFs) -> Result<()> {
+    match tokio::fs::rename(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let from = VPath::new(source);
+            let to = VPath::new(destination);
+            backend.copy(&from, &to).await?;
+            backend.remove_permanent(&from).await
+        }
     }
 }
 
@@ -27,35 +184,55 @@ fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
         .file_type()
         .map_err(|error| VfsError::from_io(error, path.as_path()))?;
     let is_symlink = file_type.is_symlink();
-    let metadata = raw.metadata().ok();
-    let kind = match &metadata {
+    let link_metadata = raw.metadata().ok();
+    let target_metadata = if is_symlink {
+        fs::metadata(path.as_path()).ok()
+    } else {
+        None
+    };
+    let metadata = target_metadata.as_ref().or(link_metadata.as_ref());
+    let kind = match metadata {
         Some(metadata) if metadata.is_dir() => EntryKind::Dir,
         Some(metadata) if metadata.is_file() => EntryKind::File,
         _ => EntryKind::Other,
     };
-    let size = match &metadata {
+    let size = match metadata {
         Some(metadata) if !metadata.is_dir() => Some(metadata.len()),
         _ => None,
     };
     #[cfg(unix)]
     let is_executable = {
         use std::os::unix::fs::PermissionsExt;
-        metadata
-            .as_ref()
-            .is_some_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        metadata.is_some_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let is_executable = {
+        let extension = name.rsplit_once('.').map(|(_, extension)| extension);
+        extension.is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "exe" | "bat" | "cmd" | "com" | "ps1" | "msi"
+            )
+        })
+    };
+    #[cfg(not(any(unix, windows)))]
     let is_executable = false;
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::MetadataExt;
-        metadata.as_ref().map(|meta| meta.mode())
+        metadata.map(|meta| meta.mode())
     };
     #[cfg(not(unix))]
     let mode = None;
 
     let modified = metadata.and_then(|metadata| metadata.modified().ok());
     let is_hidden = name.starts_with('.');
+    #[cfg(windows)]
+    let is_hidden = is_hidden
+        || metadata.is_some_and(|metadata| {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x2 != 0
+        });
 
     Ok(DirEntry {
         name,
@@ -68,6 +245,57 @@ fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
         is_executable,
         mode,
     })
+}
+
+async fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let target = tokio::fs::read_link(src)
+            .await
+            .map_err(|error| VfsError::from_io(error, src))?;
+        tokio::fs::symlink(target, dst)
+            .await
+            .map_err(|error| VfsError::from_io(error, dst))
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::copy(src, dst)
+            .await
+            .map(|_| ())
+            .map_err(|error| VfsError::from_io(error, src))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month as u32, day as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn utc_timestamp() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        remainder / 3_600,
+        (remainder % 3_600) / 60,
+        remainder % 60
+    )
 }
 
 fn read_dir_blocking(
@@ -168,6 +396,65 @@ impl Vfs for LocalFs {
         Ok(Box::new(file))
     }
 
+    async fn create_dir(&self, path: &VPath) -> Result<()> {
+        tokio::fs::create_dir_all(path.as_path())
+            .await
+            .map_err(|error| VfsError::from_io(error, path.as_path()))
+    }
+
+    async fn create_file(&self, path: &VPath) -> Result<()> {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path.as_path())
+            .await
+            .map(|_| ())
+            .map_err(|error| VfsError::from_io(error, path.as_path()))
+    }
+
+    async fn copy(&self, from: &VPath, to: &VPath) -> Result<()> {
+        let from_path = from.as_path();
+        let to_path = to.as_path();
+        if to_path.starts_with(from_path) && to_path != from_path {
+            return Err(VfsError::InvalidInput(format!(
+                "cannot copy {} into itself",
+                from_path.display()
+            )));
+        }
+
+        let mut stack = vec![(from_path.to_path_buf(), to_path.to_path_buf())];
+        while let Some((src, dst)) = stack.pop() {
+            let metadata = tokio::fs::symlink_metadata(&src)
+                .await
+                .map_err(|error| VfsError::from_io(error, &src))?;
+
+            if metadata.file_type().is_symlink() {
+                copy_symlink(&src, &dst).await?;
+            } else if metadata.is_dir() {
+                tokio::fs::create_dir_all(&dst)
+                    .await
+                    .map_err(|error| VfsError::from_io(error, &dst))?;
+                let mut reader = tokio::fs::read_dir(&src)
+                    .await
+                    .map_err(|error| VfsError::from_io(error, &src))?;
+                while let Some(entry) = reader
+                    .next_entry()
+                    .await
+                    .map_err(|error| VfsError::from_io(error, &src))?
+                {
+                    stack.push((entry.path(), dst.join(entry.file_name())));
+                }
+            } else {
+                tokio::fs::copy(&src, &dst)
+                    .await
+                    .map_err(|error| VfsError::from_io(error, &src))?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
         tokio::fs::rename(from.as_path(), to.as_path())
             .await
@@ -176,30 +463,16 @@ impl Vfs for LocalFs {
 
     async fn remove(&self, path: &VPath, mode: RemoveMode) -> Result<()> {
         if mode == RemoveMode::Trash {
-            return Err(VfsError::Unsupported(
-                "trash is not implemented for the local backend yet",
-            ));
+            return self.trash(path).await;
         }
 
-        let path_ref = path.as_path();
-        let metadata = tokio::fs::symlink_metadata(path_ref)
-            .await
-            .map_err(|error| VfsError::from_io(error, path_ref))?;
-        if metadata.is_dir() {
-            tokio::fs::remove_dir_all(path_ref)
-                .await
-                .map_err(|error| VfsError::from_io(error, path_ref))
-        } else {
-            tokio::fs::remove_file(path_ref)
-                .await
-                .map_err(|error| VfsError::from_io(error, path_ref))
-        }
+        self.remove_permanent(path).await
     }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             atomic_rename: true,
-            trash: false,
+            trash: cfg!(any(target_os = "linux", target_os = "macos")),
             symlinks: true,
             streaming_dir: true,
         }
@@ -328,18 +601,83 @@ mod tests {
         assert!(!to.exists());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn trash_is_reported_as_unsupported() {
+    async fn follows_symlinked_directories() {
         let dir = tempdir();
-        let path = dir.path().join("keep.txt");
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let entries = collect(
+            LocalFs::new()
+                .read_dir(&VPath::new(dir.path()))
+                .await
+                .expect("read_dir"),
+        )
+        .await;
+
+        let link = entries.iter().find(|entry| entry.name == "link").unwrap();
+        assert_eq!(link.kind, EntryKind::Dir);
+        assert!(link.is_symlink);
+    }
+
+    #[tokio::test]
+    async fn create_dir_and_file() {
+        let dir = tempdir();
+        let nested = dir.path().join("a/b");
+        let file = dir.path().join("note.txt");
+
+        let fs_backend = LocalFs::new();
+        fs_backend
+            .create_dir(&VPath::new(&nested))
+            .await
+            .expect("create_dir");
+        fs_backend
+            .create_file(&VPath::new(&file))
+            .await
+            .expect("create_file");
+        assert!(nested.is_dir());
+        assert!(file.is_file());
+    }
+
+    #[tokio::test]
+    async fn copies_files_and_directories() {
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("a.txt"), b"a").unwrap();
+        fs::write(source.join("nested/b.txt"), b"b").unwrap();
+
+        LocalFs::new()
+            .copy(&VPath::new(&source), &VPath::new(&destination))
+            .await
+            .expect("copy");
+
+        assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(destination.join("nested/b.txt")).unwrap(), b"b");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn trash_moves_file_and_writes_info() {
+        let dir = tempdir();
+        let trash = tempdir();
+        let path = dir.path().join("trash-me.txt");
         fs::write(&path, b"x").unwrap();
 
-        let error = LocalFs::new()
+        LocalFs::with_trash_root(trash.path())
             .remove(&VPath::new(&path), RemoveMode::Trash)
             .await
-            .expect_err("trash unsupported");
-        assert!(matches!(error, VfsError::Unsupported(_)));
-        assert!(path.exists());
+            .expect("trash");
+
+        assert!(!path.exists());
+        assert!(trash.path().join("files/trash-me.txt").is_file());
+        let info = fs::read_to_string(trash.path().join("info/trash-me.txt.trashinfo")).unwrap();
+        assert!(info.contains("[Trash Info]"));
+        assert!(info.contains("Path="));
     }
 
     #[tokio::test]

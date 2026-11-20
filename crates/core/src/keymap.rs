@@ -100,6 +100,24 @@ impl Keymap {
         keymap.bind_sequence(&[Key::Char('g'), Key::Char('T')], "tab.previous");
         keymap.bind(Key::Char('q'), "app.quit");
         keymap.bind(Key::ctrl('c'), "app.quit");
+        keymap.bind(Key::Char(' '), "app.toggle-mark");
+        keymap.bind(Key::Char('m'), "app.toggle-mark");
+        keymap.bind(Key::Char('d'), "app.delete");
+        keymap.bind(Key::Char('D'), "app.delete-permanent");
+        keymap.bind(Key::Char('y'), "app.copy");
+        keymap.bind(Key::Char('x'), "app.cut");
+        keymap.bind(Key::Char('p'), "app.paste");
+        keymap.bind(Key::Char('r'), "app.rename");
+        keymap.bind(Key::Char('n'), "app.mkdir");
+        keymap.bind(Key::Char('N'), "app.touch");
+        keymap.bind(Key::Char('o'), "app.open");
+        keymap.bind(Key::Char('H'), "view.hidden");
+        keymap.bind(Key::Char('s'), "view.sort");
+        keymap.bind(Key::Char('S'), "view.sort-reverse");
+        keymap.bind(Key::Char('/'), "app.filter");
+        keymap.bind(Key::Char('\\'), "app.clear-filter");
+        keymap.bind(Key::Char('A'), "app.select-all");
+        keymap.bind(Key::Char('u'), "app.clear-marks");
         keymap
     }
 

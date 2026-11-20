@@ -13,14 +13,17 @@ entry, and keeps the UI thread free while work happens in the background.
 
 - Vim-style navigation (`hjkl`, arrows, `gg`/`G`) with a command-based core
 - Tabs with independent directories, loading, and previews
-- Asynchronous, cancellable directory loading and sorting
+- Asynchronous, cancellable directory loading, sorting, and file operations
 - Live previews for directories, text files, and binaries, with line numbers,
   scrolling, and lightweight syntax highlighting
 - Miller columns on wide terminals: parent, current, and preview panes
+- File operations: create, rename, copy, cut, paste, delete, trash, open externally
+- Marks, filtering, hidden-file toggles, and multiple sort modes
 - Command palette (`:`) and keyboard help overlay (`?`)
 - Four color themes (Tokyo Night, Catppuccin, Gruvbox, Nord), truecolor/256/no-color
   modes, and `NO_COLOR` / `FM_ASCII` fallbacks
 - Optional file-type icons (`FM_ICONS` or `I`) and permission columns on wide lists
+- Persistent settings via `~/.config/hwe/config.toml`
 - Single self-contained binary with no runtime dependencies
 
 ## Install
@@ -76,6 +79,16 @@ fm --version
 | `G` / `End` | Go to bottom |
 | `Tab` | Focus / unfocus the preview pane |
 | `j` / `k`, `PgUp` / `PgDn` | Scroll the focused preview |
+| `Space` / `m` | Toggle mark on the selected entry |
+| `d` / `D` | Delete to trash / permanently |
+| `y` / `x` / `p` | Copy / cut / paste |
+| `r` | Rename the selected entry |
+| `n` / `N` | Create directory / empty file |
+| `o` | Open the selected entry externally |
+| `H` | Toggle hidden files |
+| `s` / `S` | Cycle sort mode / reverse sort |
+| `/` / `\` | Filter / clear filter |
+| `A` / `u` | Select all / clear marks |
 | `Ctrl+T` | Open a new tab at the current directory |
 | `Ctrl+W` | Close the current tab |
 | `gt` / `gT` | Next / previous tab |
@@ -111,6 +124,22 @@ indicated by the highlighted pane border; the footer shows the active keys.
 | `FM_COLOR` | `auto`, `truecolor`, `256`, or `none` |
 | `FM_ICONS` | `1`/`0` to enable or disable Nerd Font file icons |
 | `COLORTERM` / `TERM` | Detected to enable truecolor when supported |
+
+## Configuration
+
+Optional settings can be stored in `~/.config/hwe/config.toml` (or
+`$XDG_CONFIG_HOME/hwe/config.toml`):
+
+```toml
+theme = "nord"
+color = "truecolor"
+show_hidden = true
+sort = "modified"
+sort_reverse = false
+dirs_first = true
+```
+
+Command-line flags and environment variables override the file.
 
 ## Development
 

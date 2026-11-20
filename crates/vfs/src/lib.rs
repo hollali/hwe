@@ -37,6 +37,12 @@ pub trait Vfs: Send + Sync {
 
     async fn open_write(&self, path: &VPath) -> Result<Box<dyn AsyncWrite + Send + Unpin>>;
 
+    async fn create_dir(&self, path: &VPath) -> Result<()>;
+
+    async fn create_file(&self, path: &VPath) -> Result<()>;
+
+    async fn copy(&self, from: &VPath, to: &VPath) -> Result<()>;
+
     async fn rename(&self, from: &VPath, to: &VPath) -> Result<()>;
 
     async fn remove(&self, path: &VPath, mode: RemoveMode) -> Result<()>;

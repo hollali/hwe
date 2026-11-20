@@ -9,6 +9,8 @@ pub enum VfsError {
     PermissionDenied(String),
     #[error("not a directory: {0}")]
     NotADirectory(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
     #[error(transparent)]

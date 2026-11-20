@@ -1,19 +1,22 @@
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hwe_vfs::{DirEntry as VfsDirEntry, VPath, Vfs};
+use hwe_vfs::{DirEntry as VfsDirEntry, RemoveMode, VPath, Vfs};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+use crate::state::{
+    AppState, Clipboard, Entry, PaletteMatch, PaletteState, Preview, PreviewState, PromptKind,
+    PromptState, Settings, SortSettings, StatusLevel, sort_entries,
+};
 
 use crate::command::{Args, CommandContext, CommandRegistry};
 use crate::commands;
 use crate::effect::Effect;
 use crate::event::AppEvent;
 use crate::keymap::{Key, Keymap, Resolution};
-use crate::state::{
-    AppState, Entry, PaletteMatch, PaletteState, Preview, PreviewState, StatusLevel, sort_entries,
-};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_PREVIEW_ENTRIES: usize = 1000;
@@ -67,15 +70,15 @@ pub struct App {
     keymap: Keymap,
     vfs: Arc<dyn Vfs>,
     events: mpsc::UnboundedReceiver<AppEvent>,
-    dir_tx: mpsc::UnboundedSender<DirUpdate>,
-    dir_rx: mpsc::UnboundedReceiver<DirUpdate>,
+    dir_tx: mpsc::Sender<DirUpdate>,
+    dir_rx: mpsc::Receiver<DirUpdate>,
     load_handle: Option<JoinHandle<()>>,
-    preview_tx: mpsc::UnboundedSender<PreviewUpdate>,
-    preview_rx: mpsc::UnboundedReceiver<PreviewUpdate>,
+    preview_tx: mpsc::Sender<PreviewUpdate>,
+    preview_rx: mpsc::Receiver<PreviewUpdate>,
     preview_handle: Option<JoinHandle<()>>,
     preview_id: u64,
-    parent_tx: mpsc::UnboundedSender<ParentUpdate>,
-    parent_rx: mpsc::UnboundedReceiver<ParentUpdate>,
+    parent_tx: mpsc::Sender<ParentUpdate>,
+    parent_rx: mpsc::Receiver<ParentUpdate>,
     parent_handle: Option<JoinHandle<()>>,
     parent_id: u64,
     pending_select: Option<String>,
@@ -86,12 +89,21 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(vfs: Arc<dyn Vfs>, start: VPath, events: mpsc::UnboundedReceiver<AppEvent>) -> Self {
-        let (dir_tx, dir_rx) = mpsc::unbounded_channel();
-        let (preview_tx, preview_rx) = mpsc::unbounded_channel();
-        let (parent_tx, parent_rx) = mpsc::unbounded_channel();
+    pub fn new(
+        vfs: Arc<dyn Vfs>,
+        start: VPath,
+        events: mpsc::UnboundedReceiver<AppEvent>,
+        settings: Settings,
+    ) -> Self {
+        let (dir_tx, dir_rx) = mpsc::channel(512);
+        let (preview_tx, preview_rx) = mpsc::channel(64);
+        let (parent_tx, parent_rx) = mpsc::channel(16);
         Self {
-            state: AppState::new(start),
+            state: {
+                let mut state = AppState::new(start);
+                state.settings = settings;
+                state
+            },
             registry: commands::registry(),
             keymap: Keymap::vim(),
             vfs,
@@ -215,7 +227,12 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Resize { .. } => self.dirty = true,
-            AppEvent::Paste(_) => {}
+            AppEvent::Paste(text) => {
+                if let Some(prompt) = &mut self.state.prompt {
+                    prompt.input.push_str(&text);
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -226,6 +243,11 @@ impl App {
             if matches!(key, Key::Esc | Key::Char('?')) {
                 return;
             }
+        }
+
+        if let Some(prompt) = self.state.prompt.clone() {
+            self.handle_prompt_key(key, prompt);
+            return;
         }
 
         if self.state.palette.is_some() {
@@ -303,7 +325,183 @@ impl App {
         } else {
             current.saturating_add(delta as usize)
         };
-        self.state.preview.scroll = next.min(length.saturating_sub(1));
+        self.state.preview.scroll = next.min(length);
+        self.dirty = true;
+    }
+
+    fn selected_paths(&self) -> Vec<VPath> {
+        let tab = self.state.tab();
+        if tab.marks.is_empty() {
+            tab.selected()
+                .map(|entry| entry.path.clone())
+                .into_iter()
+                .collect()
+        } else {
+            tab.marks
+                .iter()
+                .filter_map(|index| tab.entries.get(*index).map(|entry| entry.path.clone()))
+                .collect()
+        }
+    }
+
+    fn resort_current(&mut self) {
+        let sort = self.state.settings.sort;
+        let tab = self.state.tab_mut();
+        sort_entries(&mut tab.entries, sort);
+        tab.clamp_cursor();
+        self.dirty = true;
+    }
+
+    fn copy_selection(&mut self, cut: bool) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.state.clipboard = Some(Clipboard { paths, cut });
+        self.state
+            .set_status(StatusLevel::Info, if cut { "cut" } else { "copied" });
+        self.dirty = true;
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(clipboard) = self.state.clipboard.clone() else {
+            self.state
+                .set_status(StatusLevel::Info, "clipboard is empty");
+            self.dirty = true;
+            return;
+        };
+        let destination_dir = self.state.tab().path.clone();
+        let tab_id = self.state.tab().id;
+        let load_id = {
+            let tab = self.state.tab_mut();
+            tab.load_id = tab.load_id.wrapping_add(1);
+            tab.loading = true;
+            tab.error = None;
+            tab.entries.clear();
+            tab.cursor = 0;
+            tab.load_id
+        };
+        self.state.load_state = Some((tab_id, load_id));
+        if let Some(handle) = self.load_handle.take() {
+            handle.abort();
+        }
+        let cut = clipboard.cut;
+        self.start_parent_load(&destination_dir);
+        self.dirty = true;
+        if cut {
+            self.state.clipboard = None;
+        }
+
+        let vfs = Arc::clone(&self.vfs);
+        let paths = clipboard.paths.clone();
+        let tx = self.dir_tx.clone();
+        tokio::spawn(async move {
+            for source in &paths {
+                let Some(name) = source.file_name() else {
+                    continue;
+                };
+                let destination = destination_dir.join(name);
+                if cut {
+                    let _ = vfs.rename(source, &destination).await;
+                } else {
+                    let _ = vfs.copy(source, &destination).await;
+                }
+            }
+            match vfs.read_dir(&destination_dir).await {
+                Ok(mut stream) => {
+                    if tx
+                        .send(DirUpdate::Ready {
+                            tab_id,
+                            load_id,
+                            path: destination_dir.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(entry) => {
+                                if tx
+                                    .send(DirUpdate::Entry {
+                                        tab_id,
+                                        load_id,
+                                        entry,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(DirUpdate::Failed {
+                                        tab_id,
+                                        load_id,
+                                        error: error.to_string(),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(DirUpdate::Failed {
+                            tab_id,
+                            load_id,
+                            error: error.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn delete_selection(&mut self, mode: RemoveMode) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let count = paths.len();
+        let action = crate::state::ConfirmAction::Delete { paths, mode };
+        let title = if count == 1 {
+            format!("delete {}?", Self::action_name(mode))
+        } else {
+            format!("delete {count} entries?")
+        };
+        self.state.prompt = Some(PromptState::confirm(action, title));
+        self.dirty = true;
+    }
+
+    fn action_name(mode: RemoveMode) -> &'static str {
+        match mode {
+            RemoveMode::Trash => "to trash",
+            RemoveMode::Permanent => "permanently",
+        }
+    }
+
+    fn open_external(&mut self) {
+        let Some(entry) = self.state.tab().selected().cloned() else {
+            return;
+        };
+        let path = entry.path.clone();
+        tokio::spawn(async move {
+            #[cfg(target_os = "linux")]
+            let _ = Command::new("xdg-open").arg(path.as_path()).spawn();
+            #[cfg(target_os = "macos")]
+            let _ = Command::new("open").arg(path.as_path()).spawn();
+            #[cfg(target_os = "windows")]
+            let _ = Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(path.as_path())
+                .spawn();
+        });
+        self.state.set_status(StatusLevel::Info, "opened");
         self.dirty = true;
     }
 
@@ -388,6 +586,430 @@ impl App {
         }
     }
 
+    fn handle_prompt_key(&mut self, key: Key, _prompt: PromptState) {
+        if self.state.prompt.is_none() {
+            return;
+        }
+
+        match key {
+            Key::Esc => {
+                self.state.prompt = None;
+                self.dirty = true;
+            }
+            Key::Enter => {
+                let prompt = self.state.prompt.take().unwrap();
+                self.execute_prompt(prompt);
+            }
+            Key::Backspace => {
+                let prompt = self.state.prompt.as_mut().unwrap();
+                prompt.input.pop();
+                self.dirty = true;
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                let prompt = self.state.prompt.as_mut().unwrap();
+                if prompt.is_confirm() && (ch == 'y' || ch == 'Y') {
+                    let prompt = self.state.prompt.take().unwrap();
+                    self.execute_prompt(prompt);
+                    return;
+                }
+                if prompt.is_confirm() && (ch == 'n' || ch == 'N') {
+                    self.state.prompt = None;
+                    self.dirty = true;
+                    return;
+                }
+                let prompt = self.state.prompt.as_mut().unwrap();
+                prompt.input.push(ch);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn execute_prompt(&mut self, prompt: PromptState) {
+        match prompt.kind {
+            PromptKind::Mkdir => {
+                let name = prompt.input.trim().to_string();
+                if name.is_empty() {
+                    self.state
+                        .set_status(StatusLevel::Error, "directory name is required");
+                    self.dirty = true;
+                    return;
+                }
+                let target = self.state.tab().path.join(&name);
+                let path = self.state.tab().path.clone();
+                let tab_id = self.state.tab().id;
+                let load_id = {
+                    let tab = self.state.tab_mut();
+                    tab.load_id = tab.load_id.wrapping_add(1);
+                    tab.loading = true;
+                    tab.error = None;
+                    tab.entries.clear();
+                    tab.cursor = 0;
+                    tab.load_id
+                };
+                self.state.load_state = Some((tab_id, load_id));
+                if let Some(handle) = self.load_handle.take() {
+                    handle.abort();
+                }
+                self.start_parent_load(&path);
+                self.pending_select = Some(name);
+                self.dirty = true;
+
+                let vfs = Arc::clone(&self.vfs);
+                let tx = self.dir_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = vfs.create_dir(&target).await {
+                        let _ = tx
+                            .send(DirUpdate::Failed {
+                                tab_id,
+                                load_id,
+                                error: error.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                    match vfs.read_dir(&path).await {
+                        Ok(mut stream) => {
+                            if tx
+                                .send(DirUpdate::Ready {
+                                    tab_id,
+                                    load_id,
+                                    path: path.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(entry) => {
+                                        if tx
+                                            .send(DirUpdate::Entry {
+                                                tab_id,
+                                                load_id,
+                                                entry,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(DirUpdate::Failed {
+                                                tab_id,
+                                                load_id,
+                                                error: error.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                            let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
+                        }
+                        Err(error) => {
+                            let _ = tx
+                                .send(DirUpdate::Failed {
+                                    tab_id,
+                                    load_id,
+                                    error: error.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+            PromptKind::Touch => {
+                let name = prompt.input.trim().to_string();
+                if name.is_empty() {
+                    self.state
+                        .set_status(StatusLevel::Error, "file name is required");
+                    self.dirty = true;
+                    return;
+                }
+                let target = self.state.tab().path.join(&name);
+                let path = self.state.tab().path.clone();
+                let tab_id = self.state.tab().id;
+                let load_id = {
+                    let tab = self.state.tab_mut();
+                    tab.load_id = tab.load_id.wrapping_add(1);
+                    tab.loading = true;
+                    tab.error = None;
+                    tab.entries.clear();
+                    tab.cursor = 0;
+                    tab.load_id
+                };
+                self.state.load_state = Some((tab_id, load_id));
+                if let Some(handle) = self.load_handle.take() {
+                    handle.abort();
+                }
+                self.start_parent_load(&path);
+                self.pending_select = Some(name);
+                self.dirty = true;
+
+                let vfs = Arc::clone(&self.vfs);
+                let tx = self.dir_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = vfs.create_file(&target).await {
+                        let _ = tx
+                            .send(DirUpdate::Failed {
+                                tab_id,
+                                load_id,
+                                error: error.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                    match vfs.read_dir(&path).await {
+                        Ok(mut stream) => {
+                            if tx
+                                .send(DirUpdate::Ready {
+                                    tab_id,
+                                    load_id,
+                                    path: path.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(entry) => {
+                                        if tx
+                                            .send(DirUpdate::Entry {
+                                                tab_id,
+                                                load_id,
+                                                entry,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(DirUpdate::Failed {
+                                                tab_id,
+                                                load_id,
+                                                error: error.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                            let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
+                        }
+                        Err(error) => {
+                            let _ = tx
+                                .send(DirUpdate::Failed {
+                                    tab_id,
+                                    load_id,
+                                    error: error.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+            PromptKind::Rename { target } => {
+                let name = prompt.input.trim().to_string();
+                if name.is_empty() {
+                    self.state
+                        .set_status(StatusLevel::Error, "name is required");
+                    self.dirty = true;
+                    return;
+                }
+                let destination = target
+                    .parent()
+                    .unwrap_or_else(|| target.clone())
+                    .join(&name);
+                let path = self.state.tab().path.clone();
+                let tab_id = self.state.tab().id;
+                let load_id = {
+                    let tab = self.state.tab_mut();
+                    tab.load_id = tab.load_id.wrapping_add(1);
+                    tab.loading = true;
+                    tab.error = None;
+                    tab.entries.clear();
+                    tab.cursor = 0;
+                    tab.load_id
+                };
+                self.state.load_state = Some((tab_id, load_id));
+                if let Some(handle) = self.load_handle.take() {
+                    handle.abort();
+                }
+                self.start_parent_load(&path);
+                self.pending_select = Some(name);
+                self.dirty = true;
+
+                let vfs = Arc::clone(&self.vfs);
+                let tx = self.dir_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = vfs.rename(&target, &destination).await {
+                        let _ = tx
+                            .send(DirUpdate::Failed {
+                                tab_id,
+                                load_id,
+                                error: error.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                    match vfs.read_dir(&path).await {
+                        Ok(mut stream) => {
+                            if tx
+                                .send(DirUpdate::Ready {
+                                    tab_id,
+                                    load_id,
+                                    path: path.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(entry) => {
+                                        if tx
+                                            .send(DirUpdate::Entry {
+                                                tab_id,
+                                                load_id,
+                                                entry,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(DirUpdate::Failed {
+                                                tab_id,
+                                                load_id,
+                                                error: error.to_string(),
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                            let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
+                        }
+                        Err(error) => {
+                            let _ = tx
+                                .send(DirUpdate::Failed {
+                                    tab_id,
+                                    load_id,
+                                    error: error.to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                });
+            }
+            PromptKind::Filter => {
+                self.state.tab_mut().filter = if prompt.input.is_empty() {
+                    None
+                } else {
+                    Some(prompt.input)
+                };
+                self.dirty = true;
+            }
+            PromptKind::Confirm { action } => match action {
+                crate::state::ConfirmAction::Delete { paths, mode } => {
+                    let tab_id = self.state.tab().id;
+                    let load_id = {
+                        let tab = self.state.tab_mut();
+                        tab.load_id = tab.load_id.wrapping_add(1);
+                        tab.loading = true;
+                        tab.error = None;
+                        tab.entries.clear();
+                        tab.cursor = 0;
+                        tab.marks.clear();
+                        tab.load_id
+                    };
+                    self.state.load_state = Some((tab_id, load_id));
+                    if let Some(handle) = self.load_handle.take() {
+                        handle.abort();
+                    }
+                    let path = self.state.tab().path.clone();
+                    self.start_parent_load(&path);
+                    self.pending_select = None;
+                    self.dirty = true;
+
+                    let vfs = Arc::clone(&self.vfs);
+                    let tx = self.dir_tx.clone();
+                    tokio::spawn(async move {
+                        for target in paths {
+                            let _ = vfs.remove(&target, mode).await;
+                        }
+                        match vfs.read_dir(&path).await {
+                            Ok(mut stream) => {
+                                if tx
+                                    .send(DirUpdate::Ready {
+                                        tab_id,
+                                        load_id,
+                                        path: path.clone(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                while let Some(item) = stream.next().await {
+                                    match item {
+                                        Ok(entry) => {
+                                            if tx
+                                                .send(DirUpdate::Entry {
+                                                    tab_id,
+                                                    load_id,
+                                                    entry,
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let _ = tx
+                                                .send(DirUpdate::Failed {
+                                                    tab_id,
+                                                    load_id,
+                                                    error: error.to_string(),
+                                                })
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                }
+                                let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(DirUpdate::Failed {
+                                        tab_id,
+                                        load_id,
+                                        error: error.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            },
+        }
+        self.dirty = true;
+    }
+
     fn dispatch(&mut self, name: &str) {
         let effect = {
             let mut ctx = CommandContext {
@@ -428,6 +1050,51 @@ impl App {
                 self.switch_tab(previous);
             }
             Effect::Quit => self.quit = true,
+            Effect::Prompt(prompt) => {
+                self.state.prompt = Some(prompt);
+                self.dirty = true;
+            }
+            Effect::ToggleHidden => {
+                self.state.settings.show_hidden = !self.state.settings.show_hidden;
+                self.dirty = true;
+            }
+            Effect::CycleSort => {
+                self.state.settings.sort.mode = self.state.settings.sort.mode.next();
+                self.resort_current();
+            }
+            Effect::ToggleSortReverse => {
+                self.state.settings.sort.reverse = !self.state.settings.sort.reverse;
+                self.resort_current();
+            }
+            Effect::ToggleDirsFirst => {
+                self.state.settings.sort.dirs_first = !self.state.settings.sort.dirs_first;
+                self.resort_current();
+            }
+            Effect::SetFilter(filter) => {
+                self.state.tab_mut().filter = filter;
+                self.dirty = true;
+            }
+            Effect::CopySelection { cut } => self.copy_selection(cut),
+            Effect::PasteClipboard => self.paste_clipboard(),
+            Effect::DeleteSelection { mode } => self.delete_selection(mode),
+            Effect::OpenExternal => self.open_external(),
+            Effect::SelectAll => {
+                let len = self.state.tab().entries.len();
+                self.state.tab_mut().marks = (0..len).collect();
+                self.dirty = true;
+            }
+            Effect::ClearMarks => {
+                self.state.tab_mut().marks.clear();
+                self.dirty = true;
+            }
+            Effect::ToggleMark => {
+                let cursor = self.state.tab().cursor;
+                let marks = &mut self.state.tab_mut().marks;
+                if !marks.remove(&cursor) {
+                    marks.insert(cursor);
+                }
+                self.dirty = true;
+            }
         }
     }
 
@@ -438,8 +1105,13 @@ impl App {
             tab.load_id = tab.load_id.wrapping_add(1);
             tab.loading = true;
             tab.error = None;
+            tab.entries.clear();
+            tab.cursor = 0;
+            tab.marks.clear();
+            tab.filter = None;
             tab.load_id
         };
+        self.state.load_state = Some((tab_id, load_id));
 
         if let Some(handle) = self.load_handle.take() {
             handle.abort();
@@ -452,6 +1124,7 @@ impl App {
 
         let vfs = Arc::clone(&self.vfs);
         let tx = self.dir_tx.clone();
+        let settings = self.state.settings;
         self.load_handle = Some(tokio::spawn(async move {
             match vfs.read_dir(&path).await {
                 Ok(mut stream) => {
@@ -461,6 +1134,7 @@ impl App {
                             load_id,
                             path,
                         })
+                        .await
                         .is_err()
                     {
                         return;
@@ -474,31 +1148,37 @@ impl App {
                                         load_id,
                                         entry,
                                     })
+                                    .await
                                     .is_err()
                                 {
                                     return;
                                 }
                             }
                             Err(error) => {
-                                let _ = tx.send(DirUpdate::Failed {
-                                    tab_id,
-                                    load_id,
-                                    error: error.to_string(),
-                                });
+                                let _ = tx
+                                    .send(DirUpdate::Failed {
+                                        tab_id,
+                                        load_id,
+                                        error: error.to_string(),
+                                    })
+                                    .await;
                                 return;
                             }
                         }
                     }
-                    let _ = tx.send(DirUpdate::Finished { tab_id, load_id });
+                    let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
                 }
                 Err(error) => {
-                    let _ = tx.send(DirUpdate::Failed {
-                        tab_id,
-                        load_id,
-                        error: error.to_string(),
-                    });
+                    let _ = tx
+                        .send(DirUpdate::Failed {
+                            tab_id,
+                            load_id,
+                            error: error.to_string(),
+                        })
+                        .await;
                 }
             }
+            let _ = settings;
         }));
     }
 
@@ -547,7 +1227,7 @@ impl App {
                     None
                 };
 
-                sort_entries(&mut tab.entries);
+                sort_entries(&mut tab.entries, self.state.settings.sort);
                 tab.loading = false;
 
                 if let Some(name) = self.pending_select.take() {
@@ -679,7 +1359,7 @@ impl App {
                 Preview::Error(error) => (Vec::new(), Some(error)),
                 _ => (Vec::new(), None),
             };
-            let _ = tx.send(ParentUpdate { id, entries, error });
+            let _ = tx.send(ParentUpdate { id, entries, error }).await;
         }));
     }
 
@@ -713,7 +1393,7 @@ impl App {
         let tx = self.preview_tx.clone();
         self.preview_handle = Some(tokio::spawn(async move {
             let content = load_preview(vfs, entry).await;
-            let _ = tx.send(PreviewUpdate { id, content });
+            let _ = tx.send(PreviewUpdate { id, content }).await;
         }));
     }
 
@@ -760,7 +1440,7 @@ async fn load_directory_preview(vfs: Arc<dyn Vfs>, path: &VPath) -> Preview {
     }
 
     let truncated = entries.len() == MAX_PREVIEW_ENTRIES && stream.next().await.is_some();
-    sort_entries(&mut entries);
+    sort_entries(&mut entries, SortSettings::default());
     Preview::Directory { entries, truncated }
 }
 
@@ -770,10 +1450,15 @@ async fn load_text_preview(vfs: Arc<dyn Vfs>, entry: &Entry) -> Preview {
         Err(error) => return Preview::Error(error.to_string()),
     };
 
-    let mut reader = reader.take(MAX_PREVIEW_BYTES);
+    let mut reader = reader.take(MAX_PREVIEW_BYTES + 1);
     let mut bytes = Vec::new();
     if let Err(error) = reader.read_to_end(&mut bytes).await {
         return Preview::Error(error.to_string());
+    }
+
+    let truncated_by_bytes = bytes.len() as u64 > MAX_PREVIEW_BYTES;
+    if truncated_by_bytes {
+        bytes.truncate(MAX_PREVIEW_BYTES as usize);
     }
 
     if bytes.contains(&0) {
@@ -781,13 +1466,15 @@ async fn load_text_preview(vfs: Arc<dyn Vfs>, entry: &Entry) -> Preview {
     }
 
     let text = String::from_utf8_lossy(&bytes);
-    let total_lines = text.lines().count();
-    let lines = text
-        .lines()
+    let all_lines: Vec<&str> = text.lines().collect();
+    let total_lines = all_lines.len();
+    let truncated_by_lines = total_lines > MAX_PREVIEW_LINES;
+    let lines = all_lines
+        .iter()
         .take(MAX_PREVIEW_LINES)
-        .map(sanitize_line)
+        .map(|line| sanitize_line(line))
         .collect();
-    let truncated = bytes.len() as u64 == MAX_PREVIEW_BYTES || total_lines > MAX_PREVIEW_LINES;
+    let truncated = truncated_by_bytes || truncated_by_lines;
 
     Preview::Text { lines, truncated }
 }
@@ -815,7 +1502,7 @@ mod tests {
     use super::{App, Renderer, load_preview, mpsc};
     use crate::event::AppEvent;
     use crate::keymap::Key;
-    use crate::state::{AppState, Entry, Preview};
+    use crate::state::{AppState, Entry, Preview, Settings};
 
     struct RecordingRenderer {
         events: mpsc::UnboundedSender<AppEvent>,
@@ -858,7 +1545,12 @@ mod tests {
             quit_sent: false,
         };
 
-        let app = App::new(Arc::new(LocalFs::new()), VPath::new(dir.path()), event_rx);
+        let app = App::new(
+            Arc::new(LocalFs::new()),
+            VPath::new(dir.path()),
+            event_rx,
+            Settings::default(),
+        );
         tokio::time::timeout(Duration::from_secs(5), app.run(&mut renderer))
             .await
             .expect("app should quit")

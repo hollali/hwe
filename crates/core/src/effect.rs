@@ -1,4 +1,4 @@
-use hwe_vfs::VPath;
+use hwe_vfs::{RemoveMode, VPath};
 
 #[derive(Clone, Debug)]
 pub enum Effect {
@@ -12,4 +12,17 @@ pub enum Effect {
     NextTab,
     PreviousTab,
     Quit,
+    Prompt(crate::state::PromptState),
+    ToggleHidden,
+    CycleSort,
+    ToggleSortReverse,
+    ToggleDirsFirst,
+    SetFilter(Option<String>),
+    CopySelection { cut: bool },
+    PasteClipboard,
+    DeleteSelection { mode: RemoveMode },
+    OpenExternal,
+    SelectAll,
+    ClearMarks,
+    ToggleMark,
 }

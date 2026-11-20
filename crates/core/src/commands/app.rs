@@ -1,5 +1,8 @@
+use hwe_vfs::RemoveMode;
+
 use crate::command::{Args, CommandContext, CommandHandler, CommandSpec};
 use crate::effect::Effect;
+use crate::state::{PromptKind, PromptState, StatusLevel};
 
 pub struct RefreshCommand;
 
@@ -173,5 +176,329 @@ impl CommandHandler for PreviousTabCommand {
 
     fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
         Effect::PreviousTab
+    }
+}
+
+pub struct MkdirCommand;
+
+impl CommandHandler for MkdirCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.mkdir",
+            description: "Create a directory",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::Prompt(PromptState::text(PromptKind::Mkdir, "mkdir", ""))
+    }
+}
+
+pub struct TouchCommand;
+
+impl CommandHandler for TouchCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.touch",
+            description: "Create an empty file",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::Prompt(PromptState::text(PromptKind::Touch, "touch", ""))
+    }
+}
+
+pub struct RenameCommand;
+
+impl CommandHandler for RenameCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.rename",
+            description: "Rename the selected entry",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        let Some(entry) = ctx.state.tab().selected() else {
+            ctx.state.set_status(StatusLevel::Info, "no selection");
+            return Effect::Redraw;
+        };
+        Effect::Prompt(PromptState::text(
+            PromptKind::Rename {
+                target: entry.path.clone(),
+            },
+            "rename",
+            entry.name.clone(),
+        ))
+    }
+}
+
+pub struct DeleteCommand;
+
+impl CommandHandler for DeleteCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.delete",
+            description: "Delete selected entries to trash",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::DeleteSelection {
+            mode: RemoveMode::Trash,
+        }
+    }
+}
+
+pub struct DeletePermanentCommand;
+
+impl CommandHandler for DeletePermanentCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.delete-permanent",
+            description: "Permanently delete selected entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::DeleteSelection {
+            mode: RemoveMode::Permanent,
+        }
+    }
+}
+
+pub struct CopyCommand;
+
+impl CommandHandler for CopyCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.copy",
+            description: "Copy selected entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::CopySelection { cut: false }
+    }
+}
+
+pub struct CutCommand;
+
+impl CommandHandler for CutCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.cut",
+            description: "Cut selected entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::CopySelection { cut: true }
+    }
+}
+
+pub struct PasteCommand;
+
+impl CommandHandler for PasteCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.paste",
+            description: "Paste clipboard entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::PasteClipboard
+    }
+}
+
+pub struct SelectAllCommand;
+
+impl CommandHandler for SelectAllCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.select-all",
+            description: "Select all entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::SelectAll
+    }
+}
+
+pub struct ToggleMarkCommand;
+
+impl CommandHandler for ToggleMarkCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.toggle-mark",
+            description: "Toggle mark on the selected entry",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ToggleMark
+    }
+}
+
+pub struct ClearMarksCommand;
+
+impl CommandHandler for ClearMarksCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.clear-marks",
+            description: "Clear selected marks",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ClearMarks
+    }
+}
+
+pub struct ToggleHiddenCommand;
+
+impl CommandHandler for ToggleHiddenCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "view.hidden",
+            description: "Toggle hidden files",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ToggleHidden
+    }
+}
+
+pub struct CycleSortCommand;
+
+impl CommandHandler for CycleSortCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "view.sort",
+            description: "Cycle sort mode",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::CycleSort
+    }
+}
+
+pub struct ToggleSortReverseCommand;
+
+impl CommandHandler for ToggleSortReverseCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "view.sort-reverse",
+            description: "Toggle reverse sort",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ToggleSortReverse
+    }
+}
+
+pub struct ToggleDirsFirstCommand;
+
+impl CommandHandler for ToggleDirsFirstCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "view.dirs-first",
+            description: "Toggle directories-first sorting",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ToggleDirsFirst
+    }
+}
+
+pub struct FilterCommand;
+
+impl CommandHandler for FilterCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.filter",
+            description: "Filter the current directory",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::Prompt(PromptState::text(
+            PromptKind::Filter,
+            "filter",
+            ctx.state.tab().filter.clone().unwrap_or_default(),
+        ))
+    }
+}
+
+pub struct ClearFilterCommand;
+
+impl CommandHandler for ClearFilterCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.clear-filter",
+            description: "Clear the current filter",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::SetFilter(None)
+    }
+}
+
+pub struct OpenExternalCommand;
+
+impl CommandHandler for OpenExternalCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.open",
+            description: "Open the selected entry externally",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::OpenExternal
     }
 }

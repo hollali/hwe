@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use hwe_core::Renderer;
-use hwe_core::state::{AppState, Entry, PaletteState, Preview, StatusLevel};
+use hwe_core::state::{AppState, Entry, PaletteState, Preview, PromptState, StatusLevel};
 use hwe_vfs::EntryKind;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -116,6 +116,9 @@ fn render(
     }
     if let Some(palette) = &state.palette {
         draw_palette(frame, area, palette, theme);
+    }
+    if let Some(prompt) = &state.prompt {
+        draw_prompt(frame, area, prompt, theme);
     }
 }
 
@@ -256,9 +259,42 @@ fn list_titles(
             theme.info_style(),
         ))
     } else {
-        let count = state.tab().entries.len();
-        let noun = if count == 1 { "entry" } else { "entries" };
-        Line::from(Span::styled(format!("{count} {noun} "), theme.meta_style()))
+        let tab = state.tab();
+        let visible = tab
+            .entries
+            .iter()
+            .filter(|entry| {
+                (state.settings.show_hidden || !entry.is_hidden)
+                    && tab.filter.as_ref().is_none_or(|query| {
+                        entry
+                            .name
+                            .to_ascii_lowercase()
+                            .contains(&query.to_ascii_lowercase())
+                    })
+            })
+            .count();
+        let noun = if visible == 1 { "entry" } else { "entries" };
+        let mut meta = format!("{visible} {noun}");
+        if tab.filter.is_some() {
+            meta.push_str(" [filtered]");
+        }
+        if state.settings.sort.mode != hwe_core::state::SortMode::Name
+            || state.settings.sort.reverse
+            || !state.settings.sort.dirs_first
+        {
+            meta.push_str(&format!(" sort:{}", state.settings.sort.mode.label()));
+            if state.settings.sort.reverse {
+                meta.push('↓');
+            }
+        }
+        if state.settings.show_hidden {
+            meta.push_str(" hidden");
+        }
+        let marks = tab.marks.len();
+        if marks > 0 {
+            meta.push_str(&format!(" marks:{marks}"));
+        }
+        Line::from(Span::styled(format!("{meta} "), theme.meta_style()))
     };
 
     (title, meta)
@@ -314,7 +350,7 @@ fn draw_parent_content(frame: &mut Frame<'_>, area: Rect, state: &AppState, them
         .parent
         .entries
         .iter()
-        .map(|entry| ListItem::new(entry_line(entry, content_width, theme)))
+        .map(|entry| ListItem::new(entry_line(entry, content_width, theme, false)))
         .collect();
     let list = List::new(items)
         .highlight_style(theme.selection_style())
@@ -438,8 +474,8 @@ fn draw_preview_content(
                     return;
                 }
 
-                let start = state.preview.scroll.min(lines.len().saturating_sub(1));
-                let number_width = (start + rows).to_string().len();
+                let start = state.preview.scroll.min(lines.len().saturating_sub(rows));
+                let number_width = lines.len().max(1).to_string().len();
                 let show_numbers = lines.len() > 1 && area.width >= 30;
                 let syntax = state
                     .tab()
@@ -571,12 +607,12 @@ fn draw_directory_preview(
     if rows == 0 {
         return;
     }
-    let start = scroll.min(entries.len().saturating_sub(1));
+    let start = scroll.min(entries.len().saturating_sub(rows));
     let lines: Vec<Line<'_>> = entries
         .iter()
         .skip(start)
         .take(rows)
-        .map(|entry| entry_line(entry, area.width as usize, theme))
+        .map(|entry| entry_line(entry, area.width as usize, theme, false))
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
 
@@ -764,7 +800,11 @@ fn draw_list_content(
     let content_width = list_area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem<'_>> = tab.entries[start..end]
         .iter()
-        .map(|entry| ListItem::new(entry_line(entry, content_width, theme)))
+        .enumerate()
+        .map(|(offset, entry)| {
+            let marked = tab.marks.contains(&(start + offset));
+            ListItem::new(entry_line(entry, content_width, theme, marked))
+        })
         .collect();
 
     let list = List::new(items)
@@ -871,7 +911,7 @@ fn hint_line(theme: &Theme, width: usize, hints: &[(&'static str, &'static str)]
     Line::from(spans)
 }
 
-fn entry_line(entry: &Entry, width: usize, theme: &Theme) -> Line<'static> {
+fn entry_line(entry: &Entry, width: usize, theme: &Theme, marked: bool) -> Line<'static> {
     let suffix = if entry.is_symlink {
         "@"
     } else if entry.kind == EntryKind::Dir {
@@ -921,13 +961,21 @@ fn entry_line(entry: &Entry, width: usize, theme: &Theme) -> Line<'static> {
         .unwrap_or(0);
     let use_icon = icon.is_some() && label_width > icon_width + 1;
     let name_width = label_width.saturating_sub(if use_icon { icon_width + 1 } else { 0 });
+    let sanitized_name: String = entry
+        .name
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
     let label = truncate_pad(
-        &format!("{}{}", entry.name, suffix),
+        &format!("{}{}", sanitized_name, suffix),
         name_width,
         theme.ellipsis(),
     );
 
-    let mut spans = Vec::with_capacity(5);
+    let mut spans = Vec::with_capacity(6);
+    if marked {
+        spans.push(Span::styled("*", theme.key_style()));
+    }
     if use_icon && let Some((glyph, style)) = icon {
         spans.push(Span::styled(glyph, style));
         spans.push(Span::raw(" "));
@@ -1325,7 +1373,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     }
 
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 16.min(area.height.saturating_sub(4));
+    let height = 24.min(area.height.saturating_sub(4));
     let card = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1359,6 +1407,15 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         help_line("gg / G", "top / bottom", theme),
         help_line("Tab", "focus the preview pane", theme),
         help_line("PgUp / PgDn", "scroll the preview", theme),
+        help_line("Space/m", "toggle mark", theme),
+        help_line("d / D", "delete / permanent delete", theme),
+        help_line("y / x / p", "copy / cut / paste", theme),
+        help_line("r / n / N", "rename / mkdir / touch", theme),
+        help_line("o", "open externally", theme),
+        help_line("H", "toggle hidden files", theme),
+        help_line("s / S", "sort mode / reverse", theme),
+        help_line("\\", "clear filter", theme),
+        help_line("A / u", "select all / clear marks", theme),
         help_line("C-t / C-w", "new / close tab", theme),
         help_line("gt / gT", "next / previous tab", theme),
         help_line("F5", "refresh", theme),
@@ -1466,6 +1523,61 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
             .min(palette.matches.len().saturating_sub(1)),
     ));
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+fn draw_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &PromptState, theme: &Theme) {
+    if area.width < 30 || area.height < 5 {
+        return;
+    }
+    let width = 60.min(area.width.saturating_sub(4));
+    let height = 5u16.min(area.height.saturating_sub(4));
+    let card = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height.saturating_sub(height + 2),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, card);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(if theme.ascii {
+            BorderType::Plain
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(theme.active_border_style())
+        .title_top(Line::from(Span::styled(
+            format!(" {} ", prompt.title),
+            theme.path_style(),
+        )))
+        .title_bottom(Line::from(Span::styled(
+            format!(" {} ", prompt.hint),
+            theme.meta_style(),
+        )));
+    let inner = block.inner(card);
+    frame.render_widget(block, card);
+
+    if prompt.is_confirm() {
+        let line = if prompt.input.is_empty() {
+            "Press Enter/y to confirm, Esc/n to cancel".to_string()
+        } else {
+            prompt.input.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(line).style(theme.bar_style()),
+            Rect { height: 1, ..inner },
+        );
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", theme.key_style()),
+            Span::raw(prompt.input.clone()),
+        ]))
+        .style(theme.bar_style()),
+        Rect { height: 1, ..inner },
+    );
 }
 
 fn truncate_pad(text: &str, width: usize, ellipsis: char) -> String {
