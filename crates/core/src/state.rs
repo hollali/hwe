@@ -173,7 +173,7 @@ pub struct TabState {
     pub cursor: usize,
     pub loading: bool,
     pub error: Option<String>,
-    pub marks: HashSet<usize>,
+    pub marks: HashSet<VPath>,
     pub filter: Option<String>,
 }
 
@@ -192,64 +192,112 @@ impl TabState {
         }
     }
 
-    pub fn visible_entries<'a>(&'a self, settings: &'a Settings) -> Vec<&'a Entry> {
+    pub fn visible_indices(&self, settings: &Settings) -> Vec<usize> {
+        let query = self.filter.as_ref().map(|query| query.to_ascii_lowercase());
         self.entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
                 (settings.show_hidden || !entry.is_hidden)
-                    && self.filter.as_ref().is_none_or(|query| {
-                        entry
-                            .name
-                            .to_ascii_lowercase()
-                            .contains(&query.to_ascii_lowercase())
-                    })
+                    && query
+                        .as_ref()
+                        .is_none_or(|query| entry.name.to_ascii_lowercase().contains(query))
             })
-            .map(|(_, entry)| entry)
+            .map(|(index, _)| index)
             .collect()
     }
 
-    pub fn selected(&self) -> Option<&Entry> {
-        self.entries.get(self.cursor)
+    pub fn visible_entries(&self, settings: &Settings) -> Vec<&Entry> {
+        self.visible_indices(settings)
+            .into_iter()
+            .filter_map(|index| self.entries.get(index))
+            .collect()
     }
 
-    pub fn move_cursor(&mut self, delta: isize) -> bool {
-        if self.entries.is_empty() {
+    pub fn selected(&self, settings: &Settings) -> Option<&Entry> {
+        let index = *self.visible_indices(settings).get(self.cursor)?;
+        self.entries.get(index)
+    }
+
+    pub fn move_cursor(&mut self, delta: isize, settings: &Settings) -> bool {
+        let len = self.visible_indices(settings).len();
+        if len == 0 {
             return false;
         }
 
-        let last = self.entries.len() - 1;
+        let last = len - 1;
         let next = (self.cursor as isize + delta).clamp(0, last as isize) as usize;
         let changed = next != self.cursor;
         self.cursor = next;
         changed
     }
 
-    pub fn jump_to(&mut self, index: usize) -> bool {
-        if self.entries.is_empty() {
+    pub fn jump_to(&mut self, index: usize, settings: &Settings) -> bool {
+        let len = self.visible_indices(settings).len();
+        if len == 0 {
             return false;
         }
 
-        let next = index.min(self.entries.len() - 1);
+        let next = index.min(len - 1);
         let changed = next != self.cursor;
         self.cursor = next;
         changed
     }
 
-    pub fn jump_top(&mut self) -> bool {
-        self.jump_to(0)
+    pub fn jump_top(&mut self, settings: &Settings) -> bool {
+        self.jump_to(0, settings)
     }
 
-    pub fn jump_bottom(&mut self) -> bool {
-        self.jump_to(self.entries.len().saturating_sub(1))
+    pub fn jump_bottom(&mut self, settings: &Settings) -> bool {
+        let last = self.visible_indices(settings).len().saturating_sub(1);
+        self.jump_to(last, settings)
     }
 
-    pub fn clamp_cursor(&mut self) {
-        if self.entries.is_empty() {
-            self.cursor = 0;
-        } else {
-            self.cursor = self.cursor.min(self.entries.len() - 1);
+    pub fn clamp_cursor(&mut self, settings: &Settings) {
+        let last = self.visible_indices(settings).len().saturating_sub(1);
+        self.cursor = self.cursor.min(last);
+    }
+
+    pub fn cursor_for_name(&self, settings: &Settings, name: &str) -> Option<usize> {
+        self.visible_indices(settings)
+            .into_iter()
+            .position(|index| {
+                self.entries
+                    .get(index)
+                    .is_some_and(|entry| entry.name == name)
+            })
+    }
+
+    pub fn cursor_for_path(&self, settings: &Settings, path: &VPath) -> Option<usize> {
+        self.visible_indices(settings)
+            .into_iter()
+            .position(|index| {
+                self.entries
+                    .get(index)
+                    .is_some_and(|entry| &entry.path == path)
+            })
+    }
+
+    pub fn is_marked(&self, entry: &Entry) -> bool {
+        self.marks.contains(&entry.path)
+    }
+
+    pub fn toggle_mark(&mut self, settings: &Settings) -> bool {
+        let Some(path) = self.selected(settings).map(|entry| entry.path.clone()) else {
+            return false;
+        };
+        if !self.marks.remove(&path) {
+            self.marks.insert(path);
         }
+        true
+    }
+
+    pub fn select_all(&mut self, settings: &Settings) {
+        self.marks = self
+            .visible_entries(settings)
+            .into_iter()
+            .map(|entry| entry.path.clone())
+            .collect();
     }
 }
 
@@ -312,6 +360,16 @@ pub struct PaletteState {
     pub matches: Vec<PaletteMatch>,
 }
 
+impl PaletteState {
+    pub fn command_query(&self) -> (&str, Vec<String>) {
+        let query = self.query.trim();
+        match query.split_once(char::is_whitespace) {
+            Some((name, args)) => (name, args.split_whitespace().map(str::to_string).collect()),
+            None => (query, Vec::new()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub tabs: Vec<TabState>,
@@ -362,6 +420,14 @@ impl AppState {
 
     pub fn tab_index(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    pub fn selected(&self) -> Option<&Entry> {
+        self.tab().selected(&self.settings)
+    }
+
+    pub fn visible_entries(&self) -> Vec<&Entry> {
+        self.tab().visible_entries(&self.settings)
     }
 
     pub fn open_tab(&mut self) -> usize {
@@ -435,8 +501,15 @@ pub fn sort_entries(entries: &mut [Entry], settings: SortSettings) {
 
         let primary = match settings.mode {
             SortMode::Name => name_cmp(&a.name, &b.name),
-            SortMode::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
-            SortMode::Modified => a.modified.cmp(&b.modified),
+            SortMode::Size => a
+                .size
+                .unwrap_or(0)
+                .cmp(&b.size.unwrap_or(0))
+                .then_with(|| name_cmp(&a.name, &b.name)),
+            SortMode::Modified => a
+                .modified
+                .cmp(&b.modified)
+                .then_with(|| name_cmp(&a.name, &b.name)),
             SortMode::Extension => {
                 let a_ext = extension_of(&a.name);
                 let b_ext = extension_of(&b.name);
@@ -444,12 +517,11 @@ pub fn sort_entries(entries: &mut [Entry], settings: SortSettings) {
             }
         };
 
-        let ordered = if settings.reverse {
+        if settings.reverse {
             primary.reverse()
         } else {
             primary
-        };
-        ordered.then_with(|| a.name.cmp(&b.name))
+        }
     });
 }
 
@@ -496,21 +568,74 @@ mod tests {
 
     #[test]
     fn cursor_moves_and_clamps() {
+        let settings = Settings::default();
         let mut tab = tab_with(&[("a", EntryKind::File), ("b", EntryKind::File)]);
-        assert!(tab.move_cursor(1));
+        assert!(tab.move_cursor(1, &settings));
         assert_eq!(tab.cursor, 1);
-        assert!(!tab.move_cursor(1));
+        assert!(!tab.move_cursor(1, &settings));
         assert_eq!(tab.cursor, 1);
-        assert!(tab.move_cursor(-5));
+        assert!(tab.move_cursor(-5, &settings));
         assert_eq!(tab.cursor, 0);
     }
 
     #[test]
     fn cursor_moves_are_noops_when_empty() {
+        let settings = Settings::default();
         let mut tab = tab_with(&[]);
-        assert!(!tab.move_cursor(1));
-        assert!(!tab.jump_bottom());
+        assert!(!tab.move_cursor(1, &settings));
+        assert!(!tab.jump_bottom(&settings));
         assert_eq!(tab.cursor, 0);
+    }
+
+    #[test]
+    fn hidden_and_filtered_entries_are_not_visible() {
+        let mut settings = Settings::default();
+        let tab = tab_with(&[
+            ("a.txt", EntryKind::File),
+            (".hidden", EntryKind::File),
+            ("b.md", EntryKind::File),
+        ]);
+
+        let names: Vec<&str> = tab
+            .visible_entries(&settings)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.md"]);
+
+        settings.show_hidden = true;
+        assert_eq!(tab.visible_entries(&settings).len(), 3);
+
+        let mut filtered = tab_with(&[
+            ("alpha.txt", EntryKind::File),
+            ("beta.md", EntryKind::File),
+            ("gamma.txt", EntryKind::File),
+        ]);
+        filtered.filter = Some("TXT".into());
+        let names: Vec<&str> = filtered
+            .visible_entries(&settings)
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha.txt", "gamma.txt"]);
+        assert!(filtered.move_cursor(1, &settings));
+        assert_eq!(filtered.selected(&settings).unwrap().name, "gamma.txt");
+        assert!(filtered.move_cursor(-1, &settings));
+        assert!(filtered.jump_bottom(&settings));
+        assert_eq!(filtered.selected(&settings).unwrap().name, "gamma.txt");
+    }
+
+    #[test]
+    fn marks_follow_paths_when_entries_are_reordered() {
+        let settings = Settings::default();
+        let mut tab = tab_with(&[("a", EntryKind::File), ("b", EntryKind::File)]);
+        assert!(tab.toggle_mark(&settings));
+        assert_eq!(tab.marks.len(), 1);
+        assert!(tab.is_marked(&tab.entries[0]));
+
+        tab.entries.reverse();
+        assert!(tab.is_marked(&tab.entries[1]));
+        assert!(!tab.is_marked(&tab.entries[0]));
     }
 
     #[test]
@@ -528,11 +653,12 @@ mod tests {
 
     #[test]
     fn selected_entry_follows_cursor() {
+        let settings = Settings::default();
         let mut tab = tab_with(&[("a", EntryKind::File), ("b", EntryKind::Dir)]);
-        assert_eq!(tab.selected().unwrap().name, "a");
-        tab.move_cursor(1);
-        assert_eq!(tab.selected().unwrap().name, "b");
-        tab.clamp_cursor();
+        assert_eq!(tab.selected(&settings).unwrap().name, "a");
+        tab.move_cursor(1, &settings);
+        assert_eq!(tab.selected(&settings).unwrap().name, "b");
+        tab.clamp_cursor(&settings);
         assert_eq!(tab.cursor, 1);
     }
 
@@ -556,6 +682,25 @@ mod tests {
         assert_eq!(state.tabs.len(), 1);
         assert_eq!(state.active, 0);
         assert!(!state.close_active_tab());
+    }
+
+    #[test]
+    fn palette_query_splits_command_arguments() {
+        let palette = PaletteState {
+            query: "  app.filter   note.txt  ".into(),
+            ..PaletteState::default()
+        };
+        let (name, args) = palette.command_query();
+        assert_eq!(name, "app.filter");
+        assert_eq!(args, ["note.txt"]);
+
+        let palette = PaletteState {
+            query: "filter".into(),
+            ..PaletteState::default()
+        };
+        let (name, args) = palette.command_query();
+        assert_eq!(name, "filter");
+        assert!(args.is_empty());
     }
 
     #[test]

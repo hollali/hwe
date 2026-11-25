@@ -6,14 +6,15 @@ called **Hwɛ**; the installed binary is **`fm`**.
 Hwɛ browses directories asynchronously, renders a live preview of the selected
 entry, and keeps the UI thread free while work happens in the background.
 
-> Status: early development (`0.1.0`). Navigation, tabs, previews, themes, and
-> the command palette work; file operations and search are planned.
+> Status: early development (`0.1.0`). Navigation, tabs, previews, themes,
+> filtering, file operations, and the command palette work; search is not
+> implemented yet.
 
 ## Features
 
 - Vim-style navigation (`hjkl`, arrows, `gg`/`G`) with a command-based core
 - Tabs with independent directories, loading, and previews
-- Asynchronous, cancellable directory loading, sorting, and file operations
+- Asynchronous, cancellable directory loading and previews; file operations run in background tasks
 - Live previews for directories, text files, and binaries, with line numbers,
   scrolling, and lightweight syntax highlighting
 - Miller columns on wide terminals: parent, current, and preview panes
@@ -23,8 +24,8 @@ entry, and keeps the UI thread free while work happens in the background.
 - Four color themes (Tokyo Night, Catppuccin, Gruvbox, Nord), truecolor/256/no-color
   modes, and `NO_COLOR` / `FM_ASCII` fallbacks
 - Optional file-type icons (`FM_ICONS` or `I`) and permission columns on wide lists
-- Persistent settings via `~/.config/hwe/config.toml`
-- Single self-contained binary with no runtime dependencies
+- Hidden-file and sorting settings are saved to `~/.config/hwe/config.toml`
+- Single self-contained binary (external opening uses `xdg-open`, `open`, or `cmd`)
 
 ## Install
 
@@ -83,7 +84,7 @@ fm --version
 | `d` / `D` | Delete to trash / permanently |
 | `y` / `x` / `p` | Copy / cut / paste |
 | `r` | Rename the selected entry |
-| `n` / `N` | Create directory / empty file |
+| `n` / `N` | Create directory / empty file (existing files are left untouched) |
 | `o` | Open the selected entry externally |
 | `H` | Toggle hidden files |
 | `s` / `S` | Cycle sort mode / reverse sort |
@@ -139,7 +140,12 @@ sort_reverse = false
 dirs_first = true
 ```
 
-Command-line flags and environment variables override the file.
+Precedence is command-line flags, then environment variables, then the file,
+then built-in defaults. Hidden-file and sorting changes made at runtime are
+written back to the file on quit; theme and color are never overwritten there.
+
+The command palette also exposes `view.dirs-first`, which has no default key,
+and accepts arguments, e.g. `:filter note` applies a filter directly.
 
 ## Development
 

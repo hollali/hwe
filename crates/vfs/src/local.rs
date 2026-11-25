@@ -103,23 +103,25 @@ impl LocalFs {
                 };
                 let destination = files_dir.join(&candidate);
                 let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-                if !destination.exists() && !info_path.exists() {
+                if path_available(&destination).await && path_available(&info_path).await {
                     break (destination, info_path);
                 }
                 suffix += 1;
             };
 
             let source = absolute_path(path_ref);
-            move_into(&source, &destination, self).await?;
-
             let info = format!(
                 "[Trash Info]\nPath={}\nDeletionDate={}\n",
-                source.display(),
+                percent_encode_path(&source),
                 utc_timestamp()
             );
             tokio::fs::write(&info_path, info)
                 .await
                 .map_err(|error| VfsError::from_io(error, &info_path))?;
+            if let Err(error) = move_into(&source, &destination, self).await {
+                let _ = tokio::fs::remove_file(&info_path).await;
+                return Err(error);
+            }
             Ok(())
         }
 
@@ -153,6 +155,33 @@ impl LocalFs {
             ))
         }
     }
+}
+
+async fn path_available(path: &Path) -> bool {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn percent_encode_path(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes: Vec<u8> = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -405,8 +434,7 @@ impl Vfs for LocalFs {
     async fn create_file(&self, path: &VPath) -> Result<()> {
         tokio::fs::OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(true)
+            .append(true)
             .open(path.as_path())
             .await
             .map(|_| ())
@@ -678,6 +706,27 @@ mod tests {
         let info = fs::read_to_string(trash.path().join("info/trash-me.txt.trashinfo")).unwrap();
         assert!(info.contains("[Trash Info]"));
         assert!(info.contains("Path="));
+    }
+
+    #[tokio::test]
+    async fn create_file_does_not_truncate_existing_files() {
+        let dir = tempdir();
+        let path = dir.path().join("existing.txt");
+        fs::write(&path, b"keep me").unwrap();
+
+        LocalFs::new()
+            .create_file(&VPath::new(&path))
+            .await
+            .expect("create_file");
+
+        assert_eq!(fs::read(&path).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trash_paths_are_percent_encoded() {
+        let path = std::path::Path::new("/tmp/a b#c.txt");
+        assert_eq!(super::percent_encode_path(path), "/tmp/a%20b%23c.txt");
     }
 
     #[tokio::test]

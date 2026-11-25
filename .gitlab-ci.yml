@@ -22,7 +22,7 @@ check:
   script:
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets -- -D warnings
-    - cargo test --workspace
+    - cargo test --workspace --locked
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH

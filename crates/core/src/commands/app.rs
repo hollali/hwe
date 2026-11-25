@@ -19,7 +19,7 @@ impl CommandHandler for RefreshCommand {
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
         Effect::Navigate {
             path: ctx.state.tab().path.clone(),
-            select: ctx.state.tab().selected().map(|entry| entry.name.clone()),
+            select: ctx.state.selected().map(|entry| entry.name.clone()),
         }
     }
 }
@@ -226,7 +226,7 @@ impl CommandHandler for RenameCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        let Some(entry) = ctx.state.tab().selected() else {
+        let Some(entry) = ctx.state.selected() else {
             ctx.state.set_status(StatusLevel::Info, "no selection");
             return Effect::Redraw;
         };
@@ -460,12 +460,19 @@ impl CommandHandler for FilterCommand {
         &SPEC
     }
 
-    fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        Effect::Prompt(PromptState::text(
-            PromptKind::Filter,
-            "filter",
-            ctx.state.tab().filter.clone().unwrap_or_default(),
-        ))
+    fn run(&self, ctx: &mut CommandContext<'_>, args: &Args) -> Effect {
+        match args.get(0) {
+            Some(query) => Effect::SetFilter(if query.is_empty() {
+                None
+            } else {
+                Some(query.to_string())
+            }),
+            None => Effect::Prompt(PromptState::text(
+                PromptKind::Filter,
+                "filter",
+                ctx.state.tab().filter.clone().unwrap_or_default(),
+            )),
+        }
     }
 }
 
@@ -500,5 +507,27 @@ impl CommandHandler for OpenExternalCommand {
 
     fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
         Effect::OpenExternal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hwe_vfs::VPath;
+
+    use super::*;
+    use crate::state::AppState;
+
+    #[test]
+    fn filter_command_accepts_an_argument() {
+        let mut state = AppState::new(VPath::new("/tmp"));
+        let mut ctx = CommandContext { state: &mut state };
+        let effect = FilterCommand.run(&mut ctx, &Args::new(vec!["note".into()]));
+        match effect {
+            Effect::SetFilter(Some(query)) => assert_eq!(query, "note"),
+            other => panic!("unexpected effect: {other:?}"),
+        }
+
+        let effect = FilterCommand.run(&mut ctx, &Args::empty());
+        assert!(matches!(effect, Effect::Prompt(_)));
     }
 }

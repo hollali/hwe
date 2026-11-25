@@ -17,7 +17,8 @@ impl CommandHandler for UpCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab_mut().move_cursor(-1) {
+        let settings = ctx.state.settings;
+        if ctx.state.tab_mut().move_cursor(-1, &settings) {
             Effect::Redraw
         } else {
             Effect::None
@@ -38,7 +39,8 @@ impl CommandHandler for DownCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab_mut().move_cursor(1) {
+        let settings = ctx.state.settings;
+        if ctx.state.tab_mut().move_cursor(1, &settings) {
             Effect::Redraw
         } else {
             Effect::None
@@ -59,7 +61,8 @@ impl CommandHandler for TopCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab_mut().jump_top() {
+        let settings = ctx.state.settings;
+        if ctx.state.tab_mut().jump_top(&settings) {
             Effect::Redraw
         } else {
             Effect::None
@@ -80,7 +83,8 @@ impl CommandHandler for BottomCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        if ctx.state.tab_mut().jump_bottom() {
+        let settings = ctx.state.settings;
+        if ctx.state.tab_mut().jump_bottom(&settings) {
             Effect::Redraw
         } else {
             Effect::None
@@ -134,7 +138,7 @@ impl CommandHandler for EnterCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
-        let Some(entry) = ctx.state.tab().selected() else {
+        let Some(entry) = ctx.state.selected() else {
             return Effect::None;
         };
 

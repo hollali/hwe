@@ -19,10 +19,11 @@ const AGE_WIDTH: usize = 4;
 const MODE_WIDTH: usize = 10;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ASCII_SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-const HINTS: [(&str, &str); 7] = [
+const HINTS: [(&str, &str); 8] = [
     ("j/k", "move"),
     ("h/l", "nav"),
     ("gg/G", "top/bottom"),
+    ("/", "filter"),
     ("Tab", "preview"),
     ("F5", "refresh"),
     ("?", "help"),
@@ -260,19 +261,7 @@ fn list_titles(
         ))
     } else {
         let tab = state.tab();
-        let visible = tab
-            .entries
-            .iter()
-            .filter(|entry| {
-                (state.settings.show_hidden || !entry.is_hidden)
-                    && tab.filter.as_ref().is_none_or(|query| {
-                        entry
-                            .name
-                            .to_ascii_lowercase()
-                            .contains(&query.to_ascii_lowercase())
-                    })
-            })
-            .count();
+        let visible = tab.visible_entries(&state.settings).len();
         let noun = if visible == 1 { "entry" } else { "entries" };
         let mut meta = format!("{visible} {noun}");
         if tab.filter.is_some() {
@@ -290,7 +279,11 @@ fn list_titles(
         if state.settings.show_hidden {
             meta.push_str(" hidden");
         }
-        let marks = tab.marks.len();
+        let marks = tab
+            .visible_entries(&state.settings)
+            .iter()
+            .filter(|entry| tab.is_marked(entry))
+            .count();
         if marks > 0 {
             meta.push_str(&format!(" marks:{marks}"));
         }
@@ -365,7 +358,7 @@ fn draw_parent_content(frame: &mut Frame<'_>, area: Rect, state: &AppState, them
 }
 
 fn preview_titles(state: &AppState, theme: &Theme) -> (Line<'static>, Line<'static>) {
-    let Some(entry) = state.tab().selected() else {
+    let Some(entry) = state.selected() else {
         return (
             Line::from(Span::styled(" preview ", theme.meta_style())),
             Line::from(""),
@@ -422,7 +415,7 @@ fn draw_preview_content(
         return;
     }
 
-    if state.tab().selected().is_none() {
+    if state.selected().is_none() {
         let text = if state.tab().loading {
             format!("{} loading...", spinner(theme, frame_index))
         } else {
@@ -477,10 +470,7 @@ fn draw_preview_content(
                 let start = state.preview.scroll.min(lines.len().saturating_sub(rows));
                 let number_width = lines.len().max(1).to_string().len();
                 let show_numbers = lines.len() > 1 && area.width >= 30;
-                let syntax = state
-                    .tab()
-                    .selected()
-                    .and_then(|entry| syntax_for(&entry.name));
+                let syntax = state.selected().and_then(|entry| syntax_for(&entry.name));
 
                 let visible: Vec<Line<'static>> = lines
                     .iter()
@@ -757,8 +747,9 @@ fn draw_list_content(
 
     let tab = state.tab();
     let height = area.height as usize;
+    let visible = tab.visible_entries(&state.settings);
 
-    if tab.entries.is_empty() {
+    if visible.is_empty() {
         let (title, message, style) = if let Some(error) = &tab.error {
             ("error", error.clone(), theme.error_style())
         } else if tab.loading {
@@ -778,7 +769,7 @@ fn draw_list_content(
         return;
     }
 
-    let max_scroll = tab.entries.len().saturating_sub(height);
+    let max_scroll = visible.len().saturating_sub(height);
     *scroll = (*scroll).min(max_scroll);
     if tab.cursor < *scroll {
         *scroll = tab.cursor;
@@ -787,7 +778,7 @@ fn draw_list_content(
     }
     *scroll = (*scroll).min(max_scroll);
 
-    let show_scrollbar = tab.entries.len() > height && area.width > 16;
+    let show_scrollbar = visible.len() > height && area.width > 16;
     let (list_area, scrollbar_area) = if show_scrollbar {
         let chunks = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(area);
         (chunks[0], Some(chunks[1]))
@@ -796,13 +787,12 @@ fn draw_list_content(
     };
 
     let start = *scroll;
-    let end = (start + height).min(tab.entries.len());
+    let end = (start + height).min(visible.len());
     let content_width = list_area.width.saturating_sub(2) as usize;
-    let items: Vec<ListItem<'_>> = tab.entries[start..end]
+    let items: Vec<ListItem<'_>> = visible[start..end]
         .iter()
-        .enumerate()
-        .map(|(offset, entry)| {
-            let marked = tab.marks.contains(&(start + offset));
+        .map(|entry| {
+            let marked = tab.is_marked(entry);
             ListItem::new(entry_line(entry, content_width, theme, marked))
         })
         .collect();
@@ -814,7 +804,7 @@ fn draw_list_content(
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
     if let Some(scrollbar_area) = scrollbar_area {
-        let mut scrollbar_state = ScrollbarState::new(tab.entries.len()).position(tab.cursor);
+        let mut scrollbar_state = ScrollbarState::new(visible.len()).position(tab.cursor);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None)
@@ -1373,7 +1363,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     }
 
     let width = 64.min(area.width.saturating_sub(4));
-    let height = 24.min(area.height.saturating_sub(4));
+    let height = 25.min(area.height.saturating_sub(4));
     let card = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1414,7 +1404,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         help_line("o", "open externally", theme),
         help_line("H", "toggle hidden files", theme),
         help_line("s / S", "sort mode / reverse", theme),
-        help_line("\\", "clear filter", theme),
+        help_line("/ / \\", "filter / clear filter", theme),
         help_line("A / u", "select all / clear marks", theme),
         help_line("C-t / C-w", "new / close tab", theme),
         help_line("gt / gT", "next / previous tab", theme),
