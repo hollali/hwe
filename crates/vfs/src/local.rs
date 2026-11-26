@@ -1,10 +1,12 @@
+use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -78,10 +80,12 @@ impl LocalFs {
         };
 
         let path_ref = path.as_path();
-        let name = path_ref
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unnamed".to_string());
+        let name = truncate_name(
+            &path_ref
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unnamed".to_string()),
+        );
 
         #[cfg(target_os = "linux")]
         {
@@ -95,7 +99,12 @@ impl LocalFs {
                 .map_err(|error| VfsError::from_io(error, &info_dir))?;
 
             let mut suffix = 0u32;
-            let (destination, info_path) = loop {
+            let (destination, info_path, mut info_file) = loop {
+                if suffix == u32::MAX {
+                    return Err(VfsError::InvalidInput(
+                        "could not find a free trash name".to_string(),
+                    ));
+                }
                 let candidate = if suffix == 0 {
                     name.clone()
                 } else {
@@ -103,10 +112,22 @@ impl LocalFs {
                 };
                 let destination = files_dir.join(&candidate);
                 let info_path = info_dir.join(format!("{candidate}.trashinfo"));
-                if path_available(&destination).await && path_available(&info_path).await {
-                    break (destination, info_path);
+                if !path_available(&destination).await? {
+                    suffix = suffix.saturating_add(1);
+                    continue;
                 }
-                suffix += 1;
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&info_path)
+                    .await
+                {
+                    Ok(file) => break (destination, info_path, file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        suffix = suffix.saturating_add(1);
+                    }
+                    Err(error) => return Err(VfsError::from_io(error, &info_path)),
+                }
             };
 
             let source = absolute_path(path_ref);
@@ -115,9 +136,15 @@ impl LocalFs {
                 percent_encode_path(&source),
                 utc_timestamp()
             );
-            tokio::fs::write(&info_path, info)
+            info_file
+                .write_all(info.as_bytes())
                 .await
                 .map_err(|error| VfsError::from_io(error, &info_path))?;
+            info_file
+                .flush()
+                .await
+                .map_err(|error| VfsError::from_io(error, &info_path))?;
+            drop(info_file);
             if let Err(error) = move_into(&source, &destination, self).await {
                 let _ = tokio::fs::remove_file(&info_path).await;
                 return Err(error);
@@ -132,16 +159,21 @@ impl LocalFs {
                 .map_err(|error| VfsError::from_io(error, &root))?;
             let mut suffix = 0u32;
             let destination = loop {
+                if suffix == u32::MAX {
+                    return Err(VfsError::InvalidInput(
+                        "could not find a free trash name".to_string(),
+                    ));
+                }
                 let candidate = if suffix == 0 {
                     name.clone()
                 } else {
                     format!("{name}.{suffix}")
                 };
                 let destination = root.join(candidate);
-                if !destination.exists() {
+                if path_available(&destination).await? {
                     break destination;
                 }
-                suffix += 1;
+                suffix = suffix.saturating_add(1);
             };
             let source = absolute_path(path_ref);
             move_into(&source, &destination, self).await
@@ -157,10 +189,11 @@ impl LocalFs {
     }
 }
 
-async fn path_available(path: &Path) -> bool {
+async fn path_available(path: &Path) -> Result<bool> {
     match tokio::fs::symlink_metadata(path).await {
-        Ok(_) => false,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(VfsError::from_io(error, path)),
     }
 }
 
@@ -193,16 +226,31 @@ fn absolute_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-async fn move_into(source: &Path, destination: &Path, backend: &LocalFs) -> Result<()> {
-    match tokio::fs::rename(source, destination).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let from = VPath::new(source);
-            let to = VPath::new(destination);
-            backend.copy(&from, &to).await?;
-            backend.remove_permanent(&from).await
+fn resolve_path(path: &Path) -> PathBuf {
+    let absolute = absolute_path(path);
+    for ancestor in absolute.ancestors() {
+        if let Ok(canonical) = fs::canonicalize(ancestor) {
+            return match absolute.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => canonical.join(rest),
+                _ => canonical,
+            };
         }
     }
+    absolute
+}
+
+fn truncate_name(name: &str) -> String {
+    const MAX: usize = 180;
+    if name.chars().count() <= MAX {
+        return name.to_string();
+    }
+    name.chars().take(MAX).collect()
+}
+
+async fn move_into(source: &Path, destination: &Path, backend: &LocalFs) -> Result<()> {
+    backend
+        .rename(&VPath::new(source), &VPath::new(destination))
+        .await
 }
 
 fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
@@ -274,6 +322,19 @@ fn build_entry(parent: &Path, raw: &fs::DirEntry) -> Result<DirEntry> {
         is_executable,
         mode,
     })
+}
+
+fn copy_permissions(src: &Path, dst: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(metadata) = fs::symlink_metadata(src) {
+            let _ = fs::set_permissions(dst, metadata.permissions());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, dst);
+    }
 }
 
 async fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
@@ -351,8 +412,18 @@ fn read_dir_blocking(
         let result = item
             .map_err(|error| VfsError::from_io(error, &base))
             .and_then(|raw| build_entry(&base, &raw));
-        if tx.blocking_send(result).is_err() {
-            break;
+        match result {
+            Ok(entry) => {
+                if tx.blocking_send(Ok(entry)).is_err() {
+                    break;
+                }
+            }
+            Err(VfsError::NotFound(_)) => {}
+            Err(error) => {
+                if tx.blocking_send(Err(error)).is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -432,27 +503,42 @@ impl Vfs for LocalFs {
     }
 
     async fn create_file(&self, path: &VPath) -> Result<()> {
-        tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
             .open(path.as_path())
             .await
-            .map(|_| ())
-            .map_err(|error| VfsError::from_io(error, path.as_path()))
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(VfsError::from_io(error, path.as_path())),
+        }
     }
 
     async fn copy(&self, from: &VPath, to: &VPath) -> Result<()> {
         let from_path = from.as_path();
         let to_path = to.as_path();
-        if to_path.starts_with(from_path) && to_path != from_path {
+        let from_resolved = resolve_path(from_path);
+        let to_resolved = resolve_path(to_path);
+        if to_resolved == from_resolved || to_resolved.starts_with(&from_resolved) {
             return Err(VfsError::InvalidInput(format!(
                 "cannot copy {} into itself",
                 from_path.display()
             )));
         }
+        if !path_available(&to_resolved).await? {
+            return Err(VfsError::InvalidInput(format!(
+                "{} already exists",
+                to_path.display()
+            )));
+        }
 
         let mut stack = vec![(from_path.to_path_buf(), to_path.to_path_buf())];
+        let mut visited = HashSet::new();
         while let Some((src, dst)) = stack.pop() {
+            if !visited.insert(resolve_path(&src)) {
+                continue;
+            }
             let metadata = tokio::fs::symlink_metadata(&src)
                 .await
                 .map_err(|error| VfsError::from_io(error, &src))?;
@@ -463,6 +549,7 @@ impl Vfs for LocalFs {
                 tokio::fs::create_dir_all(&dst)
                     .await
                     .map_err(|error| VfsError::from_io(error, &dst))?;
+                copy_permissions(&src, &dst);
                 let mut reader = tokio::fs::read_dir(&src)
                     .await
                     .map_err(|error| VfsError::from_io(error, &src))?;
@@ -473,10 +560,12 @@ impl Vfs for LocalFs {
                 {
                     stack.push((entry.path(), dst.join(entry.file_name())));
                 }
-            } else {
+            } else if metadata.is_file() {
                 tokio::fs::copy(&src, &dst)
                     .await
                     .map_err(|error| VfsError::from_io(error, &src))?;
+            } else {
+                return Err(VfsError::Unsupported("cannot copy special files"));
             }
         }
 
@@ -484,9 +573,18 @@ impl Vfs for LocalFs {
     }
 
     async fn rename(&self, from: &VPath, to: &VPath) -> Result<()> {
-        tokio::fs::rename(from.as_path(), to.as_path())
-            .await
-            .map_err(|error| VfsError::from_io(error, from.as_path()))
+        match tokio::fs::rename(from.as_path(), to.as_path()).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+                self.copy(from, to).await?;
+                if let Err(error) = self.remove_permanent(from).await {
+                    let _ = self.remove_permanent(to).await;
+                    return Err(error);
+                }
+                Ok(())
+            }
+            Err(error) => Err(VfsError::from_io(error, from.as_path())),
+        }
     }
 
     async fn remove(&self, path: &VPath, mode: RemoveMode) -> Result<()> {
@@ -500,7 +598,7 @@ impl Vfs for LocalFs {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             atomic_rename: true,
-            trash: cfg!(any(target_os = "linux", target_os = "macos")),
+            trash: self.trash_root().is_some(),
             symlinks: true,
             streaming_dir: true,
         }
@@ -742,5 +840,121 @@ mod tests {
         writer.flush().await.unwrap();
         drop(writer);
         assert_eq!(fs::read(&path).unwrap(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn copy_refuses_self_and_existing_destinations() {
+        let dir = tempdir();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, b"original").unwrap();
+        fs::write(&destination, b"keep").unwrap();
+        let backend = LocalFs::new();
+
+        assert!(
+            backend
+                .copy(&VPath::new(&source), &VPath::new(&source))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"original");
+
+        assert!(
+            backend
+                .copy(&VPath::new(&source), &VPath::new(&destination))
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_refuses_directory_into_itself_via_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &link).unwrap();
+        fs::write(real.join("data.txt"), b"data").unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            LocalFs::new().copy(&VPath::new(&link), &VPath::new(real.join("link"))),
+        )
+        .await;
+        assert!(outcome.is_ok(), "copy hung while copying into itself");
+        assert!(outcome.unwrap().is_err(), "copy into itself should fail");
+        assert_eq!(fs::read(real.join("data.txt")).unwrap(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_preserves_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+
+        LocalFs::new()
+            .copy(&VPath::new(&source), &VPath::new(&destination))
+            .await
+            .expect("copy");
+
+        let mode = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn trash_accepts_long_file_names() {
+        let dir = tempdir();
+        let trash = tempdir();
+        let name: String = std::iter::repeat_n('a', 250).collect();
+        let path = dir.path().join(name);
+        fs::write(&path, b"x").unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            LocalFs::with_trash_root(trash.path()).remove(&VPath::new(&path), RemoveMode::Trash),
+        )
+        .await
+        .expect("trash should not hang")
+        .expect("trash");
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(trash.path().join("files")).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rename_falls_back_to_copy_across_devices() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir();
+        let source = dir.path().join("cross-device.txt");
+        let destination = std::path::Path::new("/dev/shm")
+            .join(format!("hwe-cross-device-{}", std::process::id()));
+        let (Ok(shm), Ok(local)) = (fs::metadata("/dev/shm"), fs::metadata(dir.path())) else {
+            return;
+        };
+        if shm.dev() == local.dev() {
+            return;
+        }
+        fs::write(&source, b"payload").unwrap();
+        let _ = fs::remove_file(&destination);
+
+        LocalFs::new()
+            .rename(&VPath::new(&source), &VPath::new(&destination))
+            .await
+            .expect("cross-device rename");
+
+        assert_eq!(fs::read(&destination).unwrap(), b"payload");
+        assert!(!source.exists());
+        let _ = fs::remove_file(&destination);
     }
 }

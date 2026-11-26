@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use hwe_core::App;
 use hwe_core::state::{Settings, SortMode};
-use hwe_tui::{TuiRenderer, spawn_input};
+use hwe_tui::{TuiRenderer, is_valid_color, is_valid_theme, spawn_input};
 use hwe_vfs::{LocalFs, VPath};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -43,7 +43,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "THEME",
-        value_parser = ["tokyo-night", "catppuccin", "gruvbox", "nord"],
+        value_parser = parse_theme,
         help = "Color theme (env: FM_THEME)"
     )]
     theme: Option<String>,
@@ -51,29 +51,42 @@ struct Cli {
     #[arg(
         long,
         value_name = "MODE",
-        value_parser = ["auto", "truecolor", "256", "none"],
+        value_parser = parse_color,
         help = "Color mode (env: FM_COLOR)"
     )]
     color: Option<String>,
 }
 
-const THEMES: [&str; 4] = ["tokyo-night", "catppuccin", "gruvbox", "nord"];
-const COLORS: [&str; 4] = ["auto", "truecolor", "256", "none"];
+fn parse_theme(value: &str) -> std::result::Result<String, String> {
+    if is_valid_theme(value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("invalid theme: {value}"))
+    }
+}
+
+fn parse_color(value: &str) -> std::result::Result<String, String> {
+    if is_valid_color(value) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("invalid color mode: {value}"))
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let start = resolve_start(&cli.path)?;
     let config_path = config_path();
-    let config = load_config(config_path.as_deref());
+    let (config, config_writable) = load_config(config_path.as_deref());
     validate_config(&config);
 
     let theme = cli
         .theme
-        .or_else(|| env_value("FM_THEME"))
+        .or_else(|| env_value("FM_THEME", is_valid_theme))
         .or_else(|| config.theme.clone());
     let color = cli
         .color
-        .or_else(|| env_value("FM_COLOR"))
+        .or_else(|| env_value("FM_COLOR", is_valid_color))
         .or_else(|| config.color.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -87,11 +100,21 @@ fn main() -> Result<()> {
         color.as_deref(),
         &config,
         config_path.as_deref(),
+        config_writable,
     ))
 }
 
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+fn env_value(name: &str, valid: fn(&str) -> bool) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    if value.is_empty() {
+        return None;
+    }
+    if valid(&value) {
+        Some(value)
+    } else {
+        eprintln!("warning: ignoring invalid {name}: {value}");
+        None
+    }
 }
 
 fn resolve_start(path: &Path) -> Result<VPath> {
@@ -112,40 +135,55 @@ fn resolve_start(path: &Path) -> Result<VPath> {
     Ok(VPath::new(absolute))
 }
 
-fn config_path() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
+fn non_empty_path(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn config_path() -> Option<PathBuf> {
+    non_empty_path(std::env::var_os("XDG_CONFIG_HOME"))
+        .or_else(|| non_empty_path(std::env::var_os("HOME")))
+        .or_else(|| {
+            non_empty_path(std::env::var_os("USERPROFILE")).map(|home| home.join(".config"))
+        })
         .map(|dir| dir.join("hwe").join("config.toml"))
 }
 
-fn load_config(path: Option<&Path>) -> FileConfig {
+fn load_config(path: Option<&Path>) -> (FileConfig, bool) {
     let Some(path) = path else {
-        return FileConfig::default();
+        return (FileConfig::default(), false);
     };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return FileConfig::default();
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (FileConfig::default(), true);
+        }
+        Err(error) => {
+            eprintln!("warning: cannot read config {}: {error}", path.display());
+            return (FileConfig::default(), false);
+        }
     };
     match toml::from_str(&contents) {
-        Ok(config) => config,
+        Ok(config) => (config, true),
         Err(error) => {
             eprintln!(
                 "warning: ignoring invalid config {}: {error}",
                 path.display()
             );
-            FileConfig::default()
+            (FileConfig::default(), false)
         }
     }
 }
 
 fn validate_config(config: &FileConfig) {
     if let Some(theme) = config.theme.as_deref()
-        && !THEMES.contains(&theme)
+        && !is_valid_theme(theme)
     {
         eprintln!("warning: unknown theme in config: {theme}");
     }
     if let Some(color) = config.color.as_deref()
-        && !COLORS.contains(&color)
+        && !is_valid_color(color)
     {
         eprintln!("warning: unknown color mode in config: {color}");
     }
@@ -156,10 +194,18 @@ fn validate_config(config: &FileConfig) {
     }
 }
 
-fn save_settings(path: Option<&Path>, config: &FileConfig, settings: Settings) {
+fn save_settings(
+    path: Option<&Path>,
+    config: &FileConfig,
+    settings: Settings,
+    config_writable: bool,
+) {
     let Some(path) = path else {
         return;
     };
+    if !config_writable {
+        return;
+    }
     let saved = SavedConfig {
         theme: config.theme.as_deref(),
         color: config.color.as_deref(),
@@ -188,12 +234,13 @@ async fn run(
     color: Option<&str>,
     config: &FileConfig,
     config_path: Option<&Path>,
+    config_writable: bool,
 ) -> Result<()> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
 
     let mut renderer =
         TuiRenderer::with_options(theme, color).context("failed to initialize the terminal")?;
-    let _input = spawn_input(events_tx);
+    let input = spawn_input(events_tx);
 
     let mut settings = Settings::default();
     if let Some(show_hidden) = config.show_hidden {
@@ -214,7 +261,51 @@ async fn run(
         .run(&mut renderer)
         .await
         .context("the event loop stopped unexpectedly")?;
-    save_settings(config_path, config, settings);
+    let _ = input.join();
+    save_settings(config_path, config, settings, config_writable);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_parsers_accept_aliases_and_reject_junk() {
+        assert!(parse_theme("tokyo").is_ok());
+        assert!(parse_theme("Tokyo_Night").is_ok());
+        assert!(parse_theme("neon").is_err());
+        assert!(parse_color("truecolor").is_ok());
+        assert!(parse_color("24bit").is_ok());
+        assert!(parse_color("rainbow").is_err());
+        assert_eq!(env_value("HWE_TEST_MISSING_VALUE", is_valid_theme), None);
+    }
+
+    #[test]
+    fn config_path_points_at_the_config_file() {
+        let Some(path) = config_path() else {
+            return;
+        };
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("config.toml")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some("hwe")
+        );
+    }
+
+    #[test]
+    fn non_empty_paths_skip_missing_and_blank_values() {
+        assert_eq!(non_empty_path(None), None);
+        assert_eq!(non_empty_path(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            non_empty_path(Some(std::ffi::OsString::from("/tmp"))),
+            Some(PathBuf::from("/tmp"))
+        );
+    }
 }

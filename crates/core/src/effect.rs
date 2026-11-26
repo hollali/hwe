@@ -18,6 +18,8 @@ pub enum Effect {
     ToggleSortReverse,
     ToggleDirsFirst,
     SetFilter(Option<String>),
+    Search(Option<String>),
+    ClearSearch,
     CopySelection { cut: bool },
     PasteClipboard,
     DeleteSelection { mode: RemoveMode },

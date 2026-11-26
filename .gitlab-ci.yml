@@ -2,6 +2,7 @@ stages:
   - check
   - build
   - release
+  - mirror
 
 default:
   image: rust:1
@@ -22,6 +23,7 @@ check:
   script:
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo build --workspace --locked
     - cargo test --workspace --locked
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -35,15 +37,20 @@ build:release:
     - apt-get install -y --no-install-recommends curl
   script:
     - cargo build --release --locked -p hwe
-    - mkdir -p dist
-    - cp target/release/fm "dist/fm-${CI_COMMIT_TAG}-x86_64-unknown-linux-gnu"
-    - cd dist
-    - sha256sum fm-* > SHA256SUMS
     - |
-      for file in *; do
+      archive="fm-${CI_COMMIT_TAG}-x86_64-unknown-linux-gnu"
+      mkdir -p "dist/${archive}"
+      cp target/release/fm "dist/${archive}/fm"
+      cp README.md LICENSE-MIT LICENSE-APACHE "dist/${archive}/"
+      tar czf "dist/${archive}.tar.gz" -C dist "${archive}"
+      rm -rf "dist/${archive}"
+    - (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+    - |
+      for file in dist/*.tar.gz dist/SHA256SUMS; do
+        name=$(basename "$file")
         curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
           --upload-file "$file" \
-          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/hwe/$CI_COMMIT_TAG/$file"
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/hwe/$CI_COMMIT_TAG/$name"
       done
   artifacts:
     paths:
@@ -63,9 +70,32 @@ release:
     description: "Release $CI_COMMIT_TAG"
     assets:
       links:
-        - name: "fm (Linux x86_64)"
-          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/hwe/$CI_COMMIT_TAG/fm-$CI_COMMIT_TAG-x86_64-unknown-linux-gnu"
+        - name: "fm (Linux x86_64, tar.gz)"
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/hwe/$CI_COMMIT_TAG/fm-$CI_COMMIT_TAG-x86_64-unknown-linux-gnu.tar.gz"
         - name: "SHA256SUMS"
           url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/hwe/$CI_COMMIT_TAG/SHA256SUMS"
   rules:
+    - if: $CI_COMMIT_TAG
+
+mirror:github:
+  stage: mirror
+  image: alpine/git:latest
+  cache: []
+  variables:
+    GIT_STRATEGY: fetch
+    GIT_DEPTH: "0"
+    GIT_TERMINAL_PROMPT: "0"
+  script:
+    - |
+      set -eu
+      git remote add github "https://x-access-token:${GH_TOKEN}@github.com/hollali/hwe.git"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        ref="refs/tags/$CI_COMMIT_TAG"
+      else
+        ref="refs/heads/$CI_COMMIT_BRANCH"
+      fi
+      git push github "HEAD:$ref"
+      git push github --tags
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_TAG

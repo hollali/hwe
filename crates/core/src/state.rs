@@ -81,6 +81,7 @@ pub enum PromptKind {
     Touch,
     Rename { target: VPath },
     Filter,
+    Search,
     Confirm { action: ConfirmAction },
 }
 
@@ -164,6 +165,19 @@ impl From<VfsDirEntry> for Entry {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SearchState {
+    pub id: u64,
+    pub query: String,
+    pub root: VPath,
+    pub previous_entries: Vec<Entry>,
+    pub previous_cursor: usize,
+    pub previous_filter: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub matches: usize,
+}
+
 #[derive(Debug)]
 pub struct TabState {
     pub id: u64,
@@ -175,6 +189,7 @@ pub struct TabState {
     pub error: Option<String>,
     pub marks: HashSet<VPath>,
     pub filter: Option<String>,
+    pub search: Option<SearchState>,
 }
 
 impl TabState {
@@ -189,6 +204,7 @@ impl TabState {
             error: None,
             marks: HashSet::new(),
             filter: None,
+            search: None,
         }
     }
 
@@ -491,11 +507,7 @@ pub fn sort_entries(entries: &mut [Entry], settings: SortSettings) {
             let b_rank = u8::from(b.kind != EntryKind::Dir);
             let rank_order = a_rank.cmp(&b_rank);
             if rank_order != Ordering::Equal {
-                return if settings.reverse {
-                    rank_order.reverse()
-                } else {
-                    rank_order
-                };
+                return rank_order;
             }
         }
 
@@ -649,6 +661,24 @@ mod tests {
         sort_entries(&mut entries, SortSettings::default());
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["alpha", "beta", "Beta.txt", "zeta.txt"]);
+    }
+
+    #[test]
+    fn reverse_sort_keeps_directories_first() {
+        let mut entries = vec![
+            entry("zeta.txt", EntryKind::File),
+            entry("alpha", EntryKind::Dir),
+            entry("beta.txt", EntryKind::File),
+        ];
+        sort_entries(
+            &mut entries,
+            SortSettings {
+                reverse: true,
+                ..SortSettings::default()
+            },
+        );
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "zeta.txt", "beta.txt"]);
     }
 
     #[test]

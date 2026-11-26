@@ -7,8 +7,7 @@ Hwɛ browses directories asynchronously, renders a live preview of the selected
 entry, and keeps the UI thread free while work happens in the background.
 
 > Status: early development (`0.1.0`). Navigation, tabs, previews, themes,
-> filtering, file operations, and the command palette work; search is not
-> implemented yet.
+> filtering, recursive search, file operations, and the command palette work.
 
 ## Features
 
@@ -19,7 +18,7 @@ entry, and keeps the UI thread free while work happens in the background.
   scrolling, and lightweight syntax highlighting
 - Miller columns on wide terminals: parent, current, and preview panes
 - File operations: create, rename, copy, cut, paste, delete, trash, open externally
-- Marks, filtering, hidden-file toggles, and multiple sort modes
+- Marks, filtering, recursive search, hidden-file toggles, and multiple sort modes
 - Command palette (`:`) and keyboard help overlay (`?`)
 - Four color themes (Tokyo Night, Catppuccin, Gruvbox, Nord), truecolor/256/no-color
   modes, and `NO_COLOR` / `FM_ASCII` fallbacks
@@ -89,6 +88,7 @@ fm --version
 | `H` | Toggle hidden files |
 | `s` / `S` | Cycle sort mode / reverse sort |
 | `/` / `\` | Filter / clear filter |
+| `Ctrl+/` / `Esc` | Search recursively / clear search results |
 | `A` / `u` | Select all / clear marks |
 | `Ctrl+T` | Open a new tab at the current directory |
 | `Ctrl+W` | Close the current tab |
@@ -102,6 +102,12 @@ fm --version
 
 Directories sort before files, case-insensitively. Leaving a directory with `h`
 re-selects that directory in the parent.
+
+`Ctrl+/` searches file and directory names recursively from the current
+directory. Results are shown in place of the listing; `Enter` on a file opens
+its parent with that file selected, `h` or `Esc` restores the previous listing,
+and file operations use the result's full path. Symlinked directories are not
+followed, avoiding cycles.
 
 When the terminal is at least 76 columns wide, the right pane previews the
 selected entry:
@@ -145,7 +151,8 @@ then built-in defaults. Hidden-file and sorting changes made at runtime are
 written back to the file on quit; theme and color are never overwritten there.
 
 The command palette also exposes `view.dirs-first`, which has no default key,
-and accepts arguments, e.g. `:filter note` applies a filter directly.
+and accepts arguments, e.g. `:filter note` applies a filter directly or
+`:search note` starts a recursive search.
 
 ## Development
 
@@ -164,6 +171,25 @@ cargo test --workspace
 | `crates/tui` | `hwe-tui` | Ratatui renderer, theme, terminal input |
 | `crates/cli` | `hwe` | Clap entry point; installs the `fm` binary |
 
+## CI/CD
+
+Both hosts run format, Clippy, build, and test checks; tags additionally build
+release archives and publish a release. GitHub builds Linux, macOS (x86_64 and
+arm64), and Windows; GitLab builds Linux. Pushes to `main` and `v*` tags are
+mirrored between GitHub and GitLab. Mirroring never forces: if the refs have
+diverged, the job fails rather than overwriting history. A re-push of an
+already-synced ref is a no-op, so the two mirror jobs cannot loop.
+
+Required secrets/variables:
+
+| Host | Name | Purpose |
+| --- | --- | --- |
+| GitHub Actions | `GITLAB_TOKEN` | Token with `write_repository` scope for the GitHub -> GitLab mirror |
+| GitHub Actions | `CARGO_REGISTRY_TOKEN` | crates.io publishing (manual workflow) |
+| GitLab CI/CD | `GH_TOKEN` | Masked token with `repo` scope for the GitLab -> GitHub mirror |
+
+`GITHUB_TOKEN`, `CI_JOB_TOKEN`, and the crates.io dry-run need no manual setup.
+
 ## Releasing
 
 1. Bump the version in `[workspace.package]` **and** in the three
@@ -175,8 +201,10 @@ cargo test --workspace
    git push origin v0.1.0
    ```
 
-   The GitHub `Release` workflow builds Linux, macOS, and Windows archives.
-   The GitLab pipeline publishes a Linux binary and creates a GitLab Release.
+   The GitHub `Release` workflow builds Linux, two macOS, and Windows archives.
+   The GitLab pipeline publishes a Linux archive and creates a GitLab Release.
+   Both hosts mirror the pushed ref to the other, so either remote can be used
+   as the source of truth.
 
 3. Publish the crates (requires a `CARGO_REGISTRY_TOKEN` repository secret).
    Run the **Publish crates** workflow manually with `dry_run` disabled, or

@@ -105,6 +105,9 @@ impl CommandHandler for ParentCommand {
     }
 
     fn run(&self, ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        if ctx.state.tab().search.is_some() {
+            return Effect::ClearSearch;
+        }
         let current = ctx.state.tab().path.clone();
         match current.parent() {
             Some(parent) => {
@@ -147,6 +150,13 @@ impl CommandHandler for EnterCommand {
                 path: entry.path.clone(),
                 select: None,
             }
+        } else if ctx.state.tab().search.is_some()
+            && let Some(parent) = entry.path.parent()
+        {
+            Effect::Navigate {
+                path: parent,
+                select: Some(entry.name.clone()),
+            }
         } else {
             let message = format!("{} is not a directory", entry.name);
             ctx.state.set_status(StatusLevel::Info, message);
@@ -161,7 +171,7 @@ mod tests {
 
     use super::*;
     use crate::command::{Args, CommandContext, CommandHandler};
-    use crate::state::{AppState, Entry, StatusLevel};
+    use crate::state::{AppState, Entry, SearchState, StatusLevel};
 
     fn entry(name: &str, kind: EntryKind) -> Entry {
         Entry {
@@ -181,6 +191,22 @@ mod tests {
         let mut state = AppState::new(VPath::new("/tmp"));
         state.tab_mut().entries = entries;
         state.tab_mut().loading = false;
+        state
+    }
+
+    fn state_with_search(entries: Vec<Entry>) -> AppState {
+        let mut state = state_with(entries);
+        state.tab_mut().search = Some(SearchState {
+            id: 1,
+            query: "txt".into(),
+            root: VPath::new("/tmp"),
+            previous_entries: Vec::new(),
+            previous_cursor: 0,
+            previous_filter: None,
+            loading: false,
+            error: None,
+            matches: 0,
+        });
         state
     }
 
@@ -207,6 +233,30 @@ mod tests {
         let status = ctx.state.status.as_ref().expect("status");
         assert_eq!(status.level, StatusLevel::Info);
         assert!(status.text.contains("not a directory"));
+    }
+
+    #[test]
+    fn enter_file_in_search_jumps_to_its_parent() {
+        let mut state = state_with_search(vec![entry("notes.txt", EntryKind::File)]);
+        let mut ctx = CommandContext { state: &mut state };
+        let effect = EnterCommand.run(&mut ctx, &Args::empty());
+        match effect {
+            Effect::Navigate { path, select } => {
+                assert_eq!(path, VPath::new("/tmp"));
+                assert_eq!(select.as_deref(), Some("notes.txt"));
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parent_in_search_clears_results() {
+        let mut state = state_with_search(Vec::new());
+        let mut ctx = CommandContext { state: &mut state };
+        assert!(matches!(
+            ParentCommand.run(&mut ctx, &Args::empty()),
+            Effect::ClearSearch
+        ));
     }
 
     #[test]

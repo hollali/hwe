@@ -116,6 +116,8 @@ impl Keymap {
         keymap.bind(Key::Char('S'), "view.sort-reverse");
         keymap.bind(Key::Char('/'), "app.filter");
         keymap.bind(Key::Char('\\'), "app.clear-filter");
+        keymap.bind(Key::ctrl('/'), "app.search");
+        keymap.bind(Key::Esc, "app.clear-search");
         keymap.bind(Key::Char('A'), "app.select-all");
         keymap.bind(Key::Char('u'), "app.clear-marks");
         keymap
@@ -155,6 +157,10 @@ impl Keymap {
 
     pub fn pending(&self) -> &[Key] {
         &self.pending
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     pub fn bindings(&self) -> impl Iterator<Item = (&[Key], &'static str)> {

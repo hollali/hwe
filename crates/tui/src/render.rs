@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::execute;
 use hwe_core::Renderer;
 use hwe_core::state::{AppState, Entry, PaletteState, Preview, PromptState, StatusLevel};
 use hwe_vfs::EntryKind;
@@ -19,11 +21,12 @@ const AGE_WIDTH: usize = 4;
 const MODE_WIDTH: usize = 10;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ASCII_SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-const HINTS: [(&str, &str); 8] = [
+const HINTS: [(&str, &str); 9] = [
     ("j/k", "move"),
     ("h/l", "nav"),
     ("gg/G", "top/bottom"),
     ("/", "filter"),
+    ("^/", "search"),
     ("Tab", "preview"),
     ("F5", "refresh"),
     ("?", "help"),
@@ -49,8 +52,19 @@ impl TuiRenderer {
     }
 
     pub fn with_options(theme: Option<&str>, color: Option<&str>) -> std::io::Result<Self> {
+        let terminal = match ratatui::try_init() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                ratatui::restore();
+                return Err(error);
+            }
+        };
+        if let Err(error) = execute!(std::io::stdout(), EnableBracketedPaste) {
+            ratatui::restore();
+            return Err(error);
+        }
         Ok(Self {
-            terminal: ratatui::try_init()?,
+            terminal,
             theme: Theme::detect(theme, color),
             scroll: 0,
             frames: 0,
@@ -60,8 +74,20 @@ impl TuiRenderer {
 
 impl Drop for TuiRenderer {
     fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         ratatui::restore();
     }
+}
+
+pub fn is_valid_theme(value: &str) -> bool {
+    ThemeName::parse(value).is_some()
+}
+
+pub fn is_valid_color(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "auto" | "truecolor" | "24bit" | "256" | "indexed" | "none" | "plain" | "no-color"
+    )
 }
 
 impl Renderer for TuiRenderer {
@@ -164,7 +190,14 @@ fn draw_body(
         let (parent_inner, list_inner, preview_inner) = if framed {
             (
                 draw_pane(frame, chunks[0], parent_title, parent_meta, theme, false),
-                draw_pane(frame, chunks[2], list_title, list_meta, theme, true),
+                draw_pane(
+                    frame,
+                    chunks[2],
+                    list_title,
+                    list_meta,
+                    theme,
+                    !state.preview.focus,
+                ),
                 draw_pane(
                     frame,
                     chunks[4],
@@ -193,7 +226,14 @@ fn draw_body(
 
     let (list_inner, preview_inner) = if framed {
         (
-            draw_pane(frame, chunks[0], list_title, list_meta, theme, true),
+            draw_pane(
+                frame,
+                chunks[0],
+                list_title,
+                list_meta,
+                theme,
+                !state.preview.focus,
+            ),
             draw_pane(
                 frame,
                 chunks[2],
@@ -246,12 +286,39 @@ fn list_titles(
     theme: &Theme,
     frame_index: u64,
 ) -> (Line<'static>, Line<'static>) {
-    let name = state
-        .tab()
+    let tab = state.tab();
+    if let Some(search) = &tab.search {
+        let title = Line::from(Span::styled(
+            format!(" Search: {} ", search.query),
+            theme.path_style(),
+        ));
+        let mut meta = if search.loading {
+            format!("{} {} matches", spinner(theme, frame_index), search.matches)
+        } else {
+            format!("{} results", tab.visible_entries(&state.settings).len())
+        };
+        if let Some(error) = &search.error {
+            meta.push_str(&format!(" error:{error}"));
+        }
+        let marks = tab
+            .visible_entries(&state.settings)
+            .iter()
+            .filter(|entry| tab.is_marked(entry))
+            .count();
+        if marks > 0 {
+            meta.push_str(&format!(" marks:{marks}"));
+        }
+        return (
+            title,
+            Line::from(Span::styled(format!("{meta} "), theme.meta_style())),
+        );
+    }
+
+    let name = tab
         .path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| state.tab().path.display().to_string());
+        .unwrap_or_else(|| tab.path.display().to_string());
     let title = Line::from(Span::styled(format!(" {name} "), theme.path_style()));
 
     let meta = if state.tab().loading {
@@ -490,7 +557,7 @@ fn draw_preview_content(
                     })
                     .collect();
 
-                frame.render_widget(Paragraph::new(visible), area);
+                frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
                 if *truncated {
                     draw_more(frame, area, theme);
                 }
@@ -528,13 +595,14 @@ fn draw_message_card(
     style: Style,
     theme: &Theme,
 ) {
-    if area.width < 12 || area.height < 3 {
+    let max_width = area.width.saturating_sub(2) as usize;
+    if area.width < 12 || area.height < 3 || max_width < 16 {
         centered(frame, area, message.to_string(), style);
         return;
     }
 
-    let message_width = message.chars().count() as u16;
-    let width = (message_width + 6).clamp(16, area.width.saturating_sub(2));
+    let message_width = message.chars().count().min(usize::from(u16::MAX) - 6);
+    let width = (message_width + 6).clamp(16, max_width) as u16;
     let height = 3;
     let card = Rect {
         x: area.x + (area.width - width) / 2,
@@ -665,20 +733,43 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme)
     }
 
     frame.render_widget(Paragraph::new("").style(theme.bar_style()), area);
+    let available = area.width as usize;
     let mut spans = vec![Span::raw(" ")];
+    let mut used = 1usize;
+    let mut skipped = 0usize;
     for (index, tab) in state.tabs.iter().enumerate() {
-        let label = tab_label(&tab.path);
-        let marker = if tab.loading { "…" } else { "" };
+        let label = if theme.ascii {
+            tab_label(&tab.path).replace('…', "...")
+        } else {
+            tab_label(&tab.path)
+        };
+        let marker = if tab.loading {
+            if theme.ascii { "..." } else { "…" }
+        } else {
+            ""
+        };
+        let text = format!(" {} {label}{marker} ", index + 1);
+        let needed = text.chars().count() + 1;
+        if used + needed > available {
+            skipped += state.tabs.len() - index;
+            break;
+        }
         let style = if index == state.active {
             theme.selection_style()
         } else {
             theme.hint_style()
         };
-        spans.push(Span::styled(
-            format!(" {} {label}{marker} ", index + 1),
-            style,
-        ));
+        spans.push(Span::styled(text, style));
         spans.push(Span::raw(" "));
+        used += needed;
+    }
+    if skipped > 0 {
+        let overflow = format!("+{skipped}");
+        if used + overflow.chars().count() <= available {
+            spans.push(Span::styled(overflow, theme.hint_style()));
+        } else if let Some(last) = spans.last_mut() {
+            *last = Span::styled(overflow, theme.hint_style());
+        }
     }
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(theme.bar_style()),
@@ -1383,7 +1474,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         .title_top(Line::from(Span::styled(" keys ", theme.path_style())))
         .title_bottom(
             Line::from(Span::styled(
-                " Esc closes · : commands ",
+                if theme.ascii {
+                    " Esc closes / : commands "
+                } else {
+                    " Esc closes · : commands "
+                },
                 theme.meta_style(),
             ))
             .right_aligned(),
@@ -1424,9 +1519,10 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
     }
 
     let width = 72.min(area.width.saturating_sub(4));
-    let max_matches = area.height.saturating_sub(6) as usize;
-    let visible_matches = palette.matches.len().min(max_matches);
-    let height = (visible_matches as u16 + 4).min(area.height.saturating_sub(4));
+    let max_height = area.height.saturating_sub(4);
+    let height = ((palette.matches.len() as u64)
+        .saturating_add(6)
+        .min(max_height as u64)) as u16;
     let card = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1474,8 +1570,9 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
         width: inner.width,
         height: 1,
     };
+    let divider = if theme.ascii { "-" } else { "─" };
     frame.render_widget(
-        Paragraph::new("─".repeat(inner.width as usize)).style(theme.divider_style()),
+        Paragraph::new(divider.repeat(inner.width as usize)).style(theme.divider_style()),
         divider_area,
     );
 
@@ -1485,6 +1582,10 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
         width: inner.width,
         height: inner.height.saturating_sub(2),
     };
+    let visible_rows = list_area.height as usize;
+    if visible_rows == 0 {
+        return;
+    }
     if palette.matches.is_empty() {
         frame.render_widget(
             Paragraph::new("no matching commands").style(theme.meta_style()),
@@ -1493,9 +1594,11 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
         return;
     }
 
+    let selected = palette.selected.min(visible_rows.saturating_sub(1));
     let items: Vec<ListItem<'_>> = palette
         .matches
         .iter()
+        .take(visible_rows)
         .map(|entry| {
             ListItem::new(Line::from(vec![
                 Span::styled(entry.name.clone(), theme.code_style()),
@@ -1507,16 +1610,12 @@ fn draw_palette(frame: &mut Frame<'_>, area: Rect, palette: &PaletteState, theme
     let list = List::new(items)
         .highlight_style(theme.selection_style())
         .highlight_symbol(theme.highlight_symbol());
-    let mut list_state = ListState::default().with_selected(Some(
-        palette
-            .selected
-            .min(palette.matches.len().saturating_sub(1)),
-    ));
+    let mut list_state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, prompt: &PromptState, theme: &Theme) {
-    if area.width < 30 || area.height < 5 {
+    if area.width < 30 || area.height < 7 {
         return;
     }
     let width = 60.min(area.width.saturating_sub(4));
@@ -2366,5 +2465,26 @@ mod tests {
         let child = Path::new(&home).join("projects");
         assert_eq!(display_path(&hwe_vfs::VPath::new(&child)), "~/projects");
         assert_eq!(display_path(&hwe_vfs::VPath::new(&home)), "~");
+    }
+
+    #[test]
+    fn message_cards_survive_narrow_terminals() {
+        let theme = Theme::new(ThemeName::Nord, ColorMode::Plain, false, false);
+        for width in 12..=18 {
+            let backend = ratatui::backend::TestBackend::new(width, 8);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    draw_message_card(
+                        frame,
+                        frame.area(),
+                        "Info",
+                        "hello",
+                        Style::default(),
+                        &theme,
+                    )
+                })
+                .expect("draw");
+        }
     }
 }

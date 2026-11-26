@@ -2,12 +2,12 @@ mod app;
 mod navigation;
 
 pub use app::{
-    ClearFilterCommand, ClearMarksCommand, CloseTabCommand, CopyCommand, CutCommand,
-    CycleSortCommand, DeleteCommand, DeletePermanentCommand, FilterCommand, HelpCommand,
-    IconsCommand, MkdirCommand, NewTabCommand, NextTabCommand, OpenExternalCommand, PasteCommand,
-    PreviewFocusCommand, PreviousTabCommand, QuitCommand, RefreshCommand, RenameCommand,
-    SelectAllCommand, ThemeCommand, ToggleDirsFirstCommand, ToggleHiddenCommand, ToggleMarkCommand,
-    ToggleSortReverseCommand, TouchCommand,
+    ClearFilterCommand, ClearMarksCommand, ClearSearchCommand, CloseTabCommand, CopyCommand,
+    CutCommand, CycleSortCommand, DeleteCommand, DeletePermanentCommand, FilterCommand,
+    HelpCommand, IconsCommand, MkdirCommand, NewTabCommand, NextTabCommand, OpenExternalCommand,
+    PasteCommand, PreviewFocusCommand, PreviousTabCommand, QuitCommand, RefreshCommand,
+    RenameCommand, SearchCommand, SelectAllCommand, ThemeCommand, ToggleDirsFirstCommand,
+    ToggleHiddenCommand, ToggleMarkCommand, ToggleSortReverseCommand, TouchCommand,
 };
 pub use navigation::{
     BottomCommand, DownCommand, EnterCommand, ParentCommand, TopCommand, UpCommand,
@@ -50,6 +50,8 @@ pub fn registry() -> CommandRegistry {
     registry.register(ToggleDirsFirstCommand);
     registry.register(FilterCommand);
     registry.register(ClearFilterCommand);
+    registry.register(SearchCommand);
+    registry.register(ClearSearchCommand);
     registry.register(OpenExternalCommand);
     registry
 }

@@ -493,6 +493,47 @@ impl CommandHandler for ClearFilterCommand {
     }
 }
 
+pub struct SearchCommand;
+
+impl CommandHandler for SearchCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.search",
+            description: "Search recursively for matching entries",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, args: &Args) -> Effect {
+        match args.get(0) {
+            Some(query) => Effect::Search(Some(query.to_string())),
+            None => Effect::Prompt(PromptState::text(
+                PromptKind::Search,
+                "search",
+                String::new(),
+            )),
+        }
+    }
+}
+
+pub struct ClearSearchCommand;
+
+impl CommandHandler for ClearSearchCommand {
+    fn spec(&self) -> &'static CommandSpec {
+        static SPEC: CommandSpec = CommandSpec {
+            name: "app.clear-search",
+            description: "Clear search results and restore the directory",
+            args: &[],
+        };
+        &SPEC
+    }
+
+    fn run(&self, _ctx: &mut CommandContext<'_>, _args: &Args) -> Effect {
+        Effect::ClearSearch
+    }
+}
+
 pub struct OpenExternalCommand;
 
 impl CommandHandler for OpenExternalCommand {
@@ -516,6 +557,24 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[test]
+    fn search_command_accepts_an_argument_and_prompts() {
+        let mut state = AppState::new(VPath::new("/tmp"));
+        let mut ctx = CommandContext { state: &mut state };
+        match SearchCommand.run(&mut ctx, &Args::new(vec!["note".into()])) {
+            Effect::Search(Some(query)) => assert_eq!(query, "note"),
+            other => panic!("unexpected effect: {other:?}"),
+        }
+        assert!(matches!(
+            SearchCommand.run(&mut ctx, &Args::empty()),
+            Effect::Prompt(_)
+        ));
+        assert!(matches!(
+            ClearSearchCommand.run(&mut ctx, &Args::empty()),
+            Effect::ClearSearch
+        ));
+    }
 
     #[test]
     fn filter_command_accepts_an_argument() {

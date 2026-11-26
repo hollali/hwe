@@ -18,7 +18,7 @@ pub struct DirStream {
 }
 
 impl DirStream {
-    pub(crate) fn new(rx: mpsc::Receiver<Result<DirEntry>>) -> Self {
+    pub fn new(rx: mpsc::Receiver<Result<DirEntry>>) -> Self {
         Self { rx }
     }
 

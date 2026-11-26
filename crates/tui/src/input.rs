@@ -7,8 +7,17 @@ use hwe_core::keymap::Key;
 use tokio::sync::mpsc::UnboundedSender;
 
 fn convert_key(event: KeyEvent) -> Option<Key> {
+    if event
+        .modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+    {
+        return None;
+    }
     let control = event.modifiers.contains(KeyModifiers::CONTROL);
     let alt = event.modifiers.contains(KeyModifiers::ALT);
+    if control && alt {
+        return None;
+    }
 
     match event.code {
         KeyCode::Char(key) if control => Some(Key::ctrl(key)),
@@ -71,4 +80,40 @@ pub fn spawn_input(sender: UnboundedSender<AppEvent>) -> thread::JoinHandle<()> 
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn modifier_keys_do_not_trigger_plain_bindings() {
+        assert_eq!(
+            convert_key(key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            Some(Key::Char('q'))
+        );
+        assert_eq!(
+            convert_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(Key::ctrl('q'))
+        );
+        assert_eq!(
+            convert_key(key(KeyCode::Char('q'), KeyModifiers::ALT)),
+            Some(Key::Alt('q'))
+        );
+        assert_eq!(
+            convert_key(key(KeyCode::Char('q'), KeyModifiers::SUPER)),
+            None
+        );
+        assert_eq!(
+            convert_key(key(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            None
+        );
+    }
 }

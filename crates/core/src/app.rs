@@ -1,16 +1,16 @@
-use std::path::Component;
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hwe_vfs::{DirEntry as VfsDirEntry, RemoveMode, VPath, Vfs};
+use hwe_vfs::{DirEntry as VfsDirEntry, EntryKind, RemoveMode, VPath, Vfs};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::state::{
     AppState, Clipboard, Entry, PaletteMatch, PaletteState, Preview, PreviewState, PromptKind,
-    PromptState, Settings, SortSettings, StatusLevel, sort_entries,
+    PromptState, SearchState, Settings, StatusLevel, sort_entries,
 };
 
 use crate::command::{Args, CommandContext, CommandRegistry};
@@ -53,8 +53,14 @@ enum DirUpdate {
         error: String,
     },
     Notice {
+        tab_id: u64,
+        load_id: u64,
         level: StatusLevel,
         text: String,
+    },
+    ClipboardFinished {
+        clipboard_id: u64,
+        success: bool,
     },
 }
 
@@ -69,6 +75,28 @@ struct ParentUpdate {
     error: Option<String>,
 }
 
+enum SearchUpdate {
+    Entry {
+        tab_id: u64,
+        search_id: u64,
+        entry: Entry,
+    },
+    Finished {
+        tab_id: u64,
+        search_id: u64,
+    },
+    Failed {
+        tab_id: u64,
+        search_id: u64,
+        error: String,
+    },
+    Notice {
+        tab_id: u64,
+        search_id: u64,
+        text: String,
+    },
+}
+
 pub struct App {
     state: AppState,
     registry: CommandRegistry,
@@ -78,6 +106,7 @@ pub struct App {
     dir_tx: mpsc::Sender<DirUpdate>,
     dir_rx: mpsc::Receiver<DirUpdate>,
     load_handle: Option<JoinHandle<()>>,
+    load_retries: u32,
     preview_tx: mpsc::Sender<PreviewUpdate>,
     preview_rx: mpsc::Receiver<PreviewUpdate>,
     preview_handle: Option<JoinHandle<()>>,
@@ -86,7 +115,14 @@ pub struct App {
     parent_rx: mpsc::Receiver<ParentUpdate>,
     parent_handle: Option<JoinHandle<()>>,
     parent_id: u64,
+    search_tx: mpsc::Sender<SearchUpdate>,
+    search_rx: mpsc::Receiver<SearchUpdate>,
+    search_handle: Option<JoinHandle<()>>,
+    search_owner: Option<u64>,
+    search_id: u64,
     pending_select: Option<(u64, String)>,
+    op_handles: Vec<JoinHandle<()>>,
+    clipboard_id: u64,
     cycle_theme: bool,
     toggle_icons: bool,
     dirty: bool,
@@ -103,6 +139,7 @@ impl App {
         let (dir_tx, dir_rx) = mpsc::channel(512);
         let (preview_tx, preview_rx) = mpsc::channel(64);
         let (parent_tx, parent_rx) = mpsc::channel(16);
+        let (search_tx, search_rx) = mpsc::channel(1024);
         Self {
             state: {
                 let mut state = AppState::new(start);
@@ -116,6 +153,7 @@ impl App {
             dir_tx,
             dir_rx,
             load_handle: None,
+            load_retries: 0,
             preview_tx,
             preview_rx,
             preview_handle: None,
@@ -124,7 +162,14 @@ impl App {
             parent_rx,
             parent_handle: None,
             parent_id: 0,
+            search_tx,
+            search_rx,
+            search_handle: None,
+            search_owner: None,
+            search_id: 0,
             pending_select: None,
+            op_handles: Vec::new(),
+            clipboard_id: 0,
             cycle_theme: false,
             toggle_icons: false,
             dirty: true,
@@ -143,7 +188,15 @@ impl App {
             tokio::select! {
                 biased;
                 _ = ticker.tick() => {
-                    if self.state.expire_status() || self.state.tab().loading {
+                    if self.state.expire_status()
+                        || self.state.tab().loading
+                        || self
+                            .state
+                            .tab()
+                            .search
+                            .as_ref()
+                            .is_some_and(|search| search.loading)
+                    {
                         self.dirty = true;
                     }
                     if std::mem::take(&mut self.cycle_theme) {
@@ -208,6 +261,18 @@ impl App {
                         }
                     }
                 }
+                maybe_search = self.search_rx.recv() => {
+                    let Some(update) = maybe_search else {
+                        break;
+                    };
+                    self.apply_search_update(update);
+                    for _ in 0..1024 {
+                        match self.search_rx.try_recv() {
+                            Ok(update) => self.apply_search_update(update),
+                            Err(_) => break,
+                        }
+                    }
+                }
             }
 
             if self.quit {
@@ -224,6 +289,12 @@ impl App {
         if let Some(handle) = self.parent_handle.take() {
             handle.abort();
         }
+        if let Some(handle) = self.search_handle.take() {
+            handle.abort();
+        }
+        for handle in self.op_handles.drain(..) {
+            handle.abort();
+        }
 
         Ok(self.state.settings)
     }
@@ -233,10 +304,15 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Resize { .. } => self.dirty = true,
             AppEvent::Paste(text) => {
+                let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
                 if let Some(prompt) = &mut self.state.prompt {
                     prompt.input.push_str(&text);
-                    self.dirty = true;
+                } else if let Some(palette) = &mut self.state.palette {
+                    palette.query.push_str(&text);
+                    palette.selected = 0;
+                    self.refresh_palette();
                 }
+                self.dirty = true;
             }
         }
     }
@@ -276,18 +352,24 @@ impl App {
             }
             Resolution::Unbound => {
                 if !self.state.pending_keys.is_empty() {
-                    self.state.pending_keys.clear();
+                    self.clear_pending();
                     self.dirty = true;
                 }
             }
             Resolution::Command(name) => {
-                self.state.pending_keys.clear();
+                self.clear_pending();
                 self.dispatch(name);
             }
         }
     }
 
+    fn clear_pending(&mut self) {
+        self.keymap.clear_pending();
+        self.state.pending_keys.clear();
+    }
+
     fn handle_preview_key(&mut self, key: Key) -> bool {
+        self.clear_pending();
         match key {
             Key::Char('j') | Key::Down => {
                 self.scroll_preview(1);
@@ -335,10 +417,11 @@ impl App {
     }
 
     fn selected_paths(&self) -> Vec<VPath> {
-        let visible = self.state.visible_entries();
-        let marked: Vec<VPath> = visible
+        let tab = self.state.tab();
+        let marked: Vec<VPath> = tab
+            .entries
             .iter()
-            .filter(|entry| self.state.tab().is_marked(entry))
+            .filter(|entry| tab.is_marked(entry))
             .map(|entry| entry.path.clone())
             .collect();
         if marked.is_empty() {
@@ -352,11 +435,12 @@ impl App {
         }
     }
 
-    fn resort_current(&mut self) {
+    fn resort_all(&mut self) {
         let settings = self.state.settings;
-        let tab = self.state.tab_mut();
-        sort_entries(&mut tab.entries, settings.sort);
-        tab.clamp_cursor(&settings);
+        for tab in &mut self.state.tabs {
+            sort_entries(&mut tab.entries, settings.sort);
+            tab.clamp_cursor(&settings);
+        }
         self.dirty = true;
     }
 
@@ -374,6 +458,8 @@ impl App {
     fn begin_operation(&mut self) -> (VPath, u64, u64) {
         let path = self.state.tab().path.clone();
         let tab_id = self.state.tab().id;
+        self.abort_search_for_tab(tab_id);
+        self.abort_directory_load();
         let load_id = {
             let tab = self.state.tab_mut();
             tab.load_id = tab.load_id.wrapping_add(1);
@@ -382,12 +468,10 @@ impl App {
             tab.entries.clear();
             tab.cursor = 0;
             tab.marks.clear();
+            tab.search = None;
             tab.load_id
         };
         self.state.load_state = Some((tab_id, load_id));
-        if let Some(handle) = self.load_handle.take() {
-            handle.abort();
-        }
         self.start_parent_load(&path);
         self.dirty = true;
         (path, tab_id, load_id)
@@ -399,6 +483,7 @@ impl App {
             return;
         }
         self.state.clipboard = Some(Clipboard { paths, cut });
+        self.clipboard_id = self.clipboard_id.wrapping_add(1);
         self.state
             .set_status(StatusLevel::Info, if cut { "cut" } else { "copied" });
         self.dirty = true;
@@ -413,22 +498,26 @@ impl App {
         };
         let (destination_dir, tab_id, load_id) = self.begin_operation();
         let cut = clipboard.cut;
-        if cut {
-            self.state.clipboard = None;
-        }
+        self.clipboard_id = self.clipboard_id.wrapping_add(1);
+        let clipboard_id = self.clipboard_id;
 
         let vfs = Arc::clone(&self.vfs);
         let paths = clipboard.paths;
         let tx = self.dir_tx.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut failures = Vec::new();
             let mut done = 0;
             for source in &paths {
                 let Some(name) = source.file_name() else {
+                    failures.push(format!("{} has no file name", source.display()));
                     continue;
                 };
                 let destination = destination_dir.join(name);
                 if *source == destination {
+                    continue;
+                }
+                if vfs.stat(&destination).await.is_ok() {
+                    failures.push(format!("{} already exists", destination.display()));
                     continue;
                 }
                 let result = if cut {
@@ -442,15 +531,7 @@ impl App {
                 }
             }
             let verb = if cut { "moved" } else { "copied" };
-            let (level, text) = if failures.is_empty() {
-                (
-                    StatusLevel::Info,
-                    format!(
-                        "{verb} {done} {}",
-                        if done == 1 { "entry" } else { "entries" }
-                    ),
-                )
-            } else {
+            let (level, text) = if !failures.is_empty() {
                 (
                     StatusLevel::Error,
                     format!(
@@ -459,10 +540,29 @@ impl App {
                         failures.join("; ")
                     ),
                 )
+            } else if done == 0 {
+                (StatusLevel::Info, "nothing to paste".to_string())
+            } else {
+                (
+                    StatusLevel::Info,
+                    format!(
+                        "{verb} {done} {}",
+                        if done == 1 { "entry" } else { "entries" }
+                    ),
+                )
             };
-            send_notice(&tx, level, text).await;
+            send_notice(&tx, tab_id, load_id, level, text).await;
+            if cut {
+                let _ = tx
+                    .send(DirUpdate::ClipboardFinished {
+                        clipboard_id,
+                        success: done > 0 && failures.is_empty(),
+                    })
+                    .await;
+            }
             stream_dir(vfs, tx, destination_dir, tab_id, load_id).await;
         });
+        self.op_handles.push(handle);
     }
 
     fn delete_selection(&mut self, mode: RemoveMode) {
@@ -518,7 +618,7 @@ impl App {
     }
 
     fn open_palette(&mut self) {
-        self.state.pending_keys.clear();
+        self.clear_pending();
         self.state.palette = Some(PaletteState::default());
         self.refresh_palette();
         self.dirty = true;
@@ -668,7 +768,7 @@ impl App {
 
                 let vfs = Arc::clone(&self.vfs);
                 let tx = self.dir_tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(error) = vfs.create_dir(&target).await {
                         let _ = tx
                             .send(DirUpdate::Failed {
@@ -679,9 +779,10 @@ impl App {
                             .await;
                         return;
                     }
-                    send_notice(&tx, StatusLevel::Info, "directory created").await;
+                    send_notice(&tx, tab_id, load_id, StatusLevel::Info, "directory created").await;
                     stream_dir(vfs, tx, path, tab_id, load_id).await;
                 });
+                self.op_handles.push(handle);
             }
             PromptKind::Touch => {
                 let name = match validate_name(&prompt.input) {
@@ -700,7 +801,7 @@ impl App {
 
                 let vfs = Arc::clone(&self.vfs);
                 let tx = self.dir_tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(error) = vfs.create_file(&target).await {
                         let _ = tx
                             .send(DirUpdate::Failed {
@@ -711,9 +812,10 @@ impl App {
                             .await;
                         return;
                     }
-                    send_notice(&tx, StatusLevel::Info, "file created").await;
+                    send_notice(&tx, tab_id, load_id, StatusLevel::Info, "file created").await;
                     stream_dir(vfs, tx, path, tab_id, load_id).await;
                 });
+                self.op_handles.push(handle);
             }
             PromptKind::Rename { target } => {
                 let name = match validate_name(&prompt.input) {
@@ -735,7 +837,7 @@ impl App {
 
                 let vfs = Arc::clone(&self.vfs);
                 let tx = self.dir_tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if destination != target && vfs.stat(&destination).await.is_ok() {
                         let _ = tx
                             .send(DirUpdate::Failed {
@@ -756,9 +858,10 @@ impl App {
                             .await;
                         return;
                     }
-                    send_notice(&tx, StatusLevel::Info, "renamed").await;
+                    send_notice(&tx, tab_id, load_id, StatusLevel::Info, "renamed").await;
                     stream_dir(vfs, tx, path, tab_id, load_id).await;
                 });
+                self.op_handles.push(handle);
             }
             PromptKind::Filter => {
                 self.state.tab_mut().filter = if prompt.input.trim().is_empty() {
@@ -768,6 +871,7 @@ impl App {
                 };
                 self.refresh_view();
             }
+            PromptKind::Search => self.start_search(prompt.input.trim().to_string()),
             PromptKind::Confirm { action } => match action {
                 crate::state::ConfirmAction::Delete { paths, mode } => {
                     let (path, tab_id, load_id) = self.begin_operation();
@@ -776,7 +880,7 @@ impl App {
                     let vfs = Arc::clone(&self.vfs);
                     let tx = self.dir_tx.clone();
                     let count = paths.len();
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         let mut failures = Vec::new();
                         for target in paths {
                             if let Err(error) = vfs.remove(&target, mode).await {
@@ -800,9 +904,10 @@ impl App {
                         } else {
                             StatusLevel::Error
                         };
-                        send_notice(&tx, level, text).await;
+                        send_notice(&tx, tab_id, load_id, level, text).await;
                         stream_dir(vfs, tx, path, tab_id, load_id).await;
                     });
+                    self.op_handles.push(handle);
                 }
             },
         }
@@ -854,6 +959,7 @@ impl App {
             }
             Effect::Quit => self.quit = true,
             Effect::Prompt(prompt) => {
+                self.clear_pending();
                 self.state.prompt = Some(prompt);
                 self.dirty = true;
             }
@@ -863,20 +969,22 @@ impl App {
             }
             Effect::CycleSort => {
                 self.state.settings.sort.mode = self.state.settings.sort.mode.next();
-                self.resort_current();
+                self.resort_all();
             }
             Effect::ToggleSortReverse => {
                 self.state.settings.sort.reverse = !self.state.settings.sort.reverse;
-                self.resort_current();
+                self.resort_all();
             }
             Effect::ToggleDirsFirst => {
                 self.state.settings.sort.dirs_first = !self.state.settings.sort.dirs_first;
-                self.resort_current();
+                self.resort_all();
             }
             Effect::SetFilter(filter) => {
                 self.state.tab_mut().filter = filter;
                 self.refresh_view();
             }
+            Effect::Search(query) => self.start_search(query.unwrap_or_default()),
+            Effect::ClearSearch => self.clear_search(),
             Effect::CopySelection { cut } => self.copy_selection(cut),
             Effect::PasteClipboard => self.paste_clipboard(),
             Effect::DeleteSelection { mode } => self.delete_selection(mode),
@@ -900,25 +1008,25 @@ impl App {
 
     fn start_load(&mut self, path: VPath, select: Option<String>) {
         let tab_id = self.state.tab().id;
+        self.abort_search_for_tab(tab_id);
+        self.abort_directory_load();
         let load_id = {
             let tab = self.state.tab_mut();
             tab.load_id = tab.load_id.wrapping_add(1);
+            tab.path = path.clone();
             tab.loading = true;
             tab.error = None;
             tab.entries.clear();
             tab.cursor = 0;
             tab.marks.clear();
             tab.filter = None;
+            tab.search = None;
             tab.load_id
         };
         self.state.load_state = Some((tab_id, load_id));
 
-        if let Some(handle) = self.load_handle.take() {
-            handle.abort();
-        }
-
         self.pending_select = select.map(|name| (tab_id, name));
-        self.state.pending_keys.clear();
+        self.clear_pending();
         self.start_parent_load(&path);
         self.dirty = true;
 
@@ -930,9 +1038,33 @@ impl App {
     }
 
     fn apply_dir_update(&mut self, update: DirUpdate) {
-        if let DirUpdate::Notice { level, text } = &update {
-            self.state.set_status(*level, text.clone());
-            self.dirty = true;
+        if let DirUpdate::Notice {
+            tab_id,
+            load_id,
+            level,
+            text,
+        } = &update
+        {
+            let current = self
+                .state
+                .tab_index(*tab_id)
+                .is_some_and(|index| self.state.tabs[index].load_id == *load_id);
+            if current {
+                self.state.set_status(*level, text.clone());
+                self.dirty = true;
+            }
+            return;
+        }
+
+        if let DirUpdate::ClipboardFinished {
+            clipboard_id,
+            success,
+        } = update
+        {
+            if clipboard_id == self.clipboard_id && success {
+                self.state.clipboard = None;
+                self.dirty = true;
+            }
             return;
         }
 
@@ -947,7 +1079,7 @@ impl App {
             | DirUpdate::Failed {
                 tab_id, load_id, ..
             } => (*tab_id, *load_id),
-            DirUpdate::Notice { .. } => return,
+            DirUpdate::Notice { .. } | DirUpdate::ClipboardFinished { .. } => return,
         };
         let Some(index) = self.state.tab_index(tab_id) else {
             return;
@@ -974,6 +1106,7 @@ impl App {
                 self.dirty = true;
             }
             DirUpdate::Finished { .. } => {
+                self.load_retries = 0;
                 let settings = self.state.settings;
                 let tab = &mut self.state.tabs[index];
                 let hovered = if tab.cursor > 0 {
@@ -1002,14 +1135,258 @@ impl App {
                 self.dirty = true;
             }
             DirUpdate::Failed { error, .. } => {
-                let tab = &mut self.state.tabs[index];
-                tab.loading = false;
-                tab.error = Some(error.clone());
                 self.pending_select = None;
-                self.state.set_status(StatusLevel::Error, error);
+                if self.load_retries >= 2 {
+                    let tab = &mut self.state.tabs[index];
+                    tab.error = Some(error.clone());
+                    tab.loading = false;
+                    self.load_handle = None;
+                    self.state.load_state = None;
+                    if index == self.state.active {
+                        self.state.set_status(StatusLevel::Error, error);
+                    }
+                    self.dirty = true;
+                    return;
+                }
+                self.load_retries += 1;
+                let retry = {
+                    let tab = &mut self.state.tabs[index];
+                    tab.error = None;
+                    tab.load_id = tab.load_id.wrapping_add(1);
+                    tab.loading = true;
+                    (tab.path.clone(), tab.load_id)
+                };
+                if index == self.state.active {
+                    self.state.set_status(StatusLevel::Error, error);
+                }
+                if let Some(handle) = self.load_handle.take() {
+                    handle.abort();
+                }
+                let vfs = Arc::clone(&self.vfs);
+                let tx = self.dir_tx.clone();
+                let (path, load_id) = retry;
+                self.state.load_state = Some((tab_id, load_id));
+                self.load_handle = Some(tokio::spawn(async move {
+                    stream_dir(vfs, tx, path, tab_id, load_id).await;
+                }));
                 self.dirty = true;
             }
-            DirUpdate::Notice { .. } => {}
+            DirUpdate::Notice { .. } | DirUpdate::ClipboardFinished { .. } => {}
+        }
+    }
+
+    fn start_search(&mut self, query: String) {
+        if query.is_empty() {
+            self.state
+                .set_status(StatusLevel::Info, "enter a search query");
+            self.dirty = true;
+            return;
+        }
+
+        let tab_id = self.state.tab().id;
+        self.search_id = self.search_id.wrapping_add(1);
+        let search_id = self.search_id;
+        if let Some(owner) = self.search_owner.take() {
+            if let Some(handle) = self.search_handle.take() {
+                handle.abort();
+            }
+            if let Some(index) = self.state.tab_index(owner)
+                && let Some(search) = self.state.tabs[index].search.as_mut()
+            {
+                search.id = search_id;
+                search.loading = false;
+            }
+        }
+        self.abort_directory_load();
+
+        let (root, previous_entries, previous_cursor, previous_filter) = {
+            let tab = self.state.tab();
+            match &tab.search {
+                Some(search) => (
+                    search.root.clone(),
+                    search.previous_entries.clone(),
+                    search.previous_cursor,
+                    search.previous_filter.clone(),
+                ),
+                None => (
+                    tab.path.clone(),
+                    tab.entries.clone(),
+                    tab.cursor,
+                    tab.filter.clone(),
+                ),
+            }
+        };
+        {
+            let tab = self.state.tab_mut();
+            tab.load_id = tab.load_id.wrapping_add(1);
+            tab.loading = false;
+            tab.error = None;
+            tab.entries.clear();
+            tab.cursor = 0;
+            tab.filter = None;
+            tab.search = Some(SearchState {
+                id: search_id,
+                query: query.clone(),
+                root: root.clone(),
+                previous_entries,
+                previous_cursor,
+                previous_filter,
+                loading: true,
+                error: None,
+                matches: 0,
+            });
+        }
+        self.search_owner = Some(tab_id);
+        self.state
+            .set_status(StatusLevel::Info, format!("searching for {query}..."));
+        self.dirty = true;
+
+        let vfs = Arc::clone(&self.vfs);
+        let tx = self.search_tx.clone();
+        self.search_handle = Some(tokio::spawn(async move {
+            walk_search(vfs, tx, root, query, tab_id, search_id).await;
+        }));
+    }
+
+    fn clear_search(&mut self) {
+        let tab_id = self.state.tab().id;
+        let Some(index) = self.state.tab_index(tab_id) else {
+            return;
+        };
+        let Some(search) = self.state.tabs[index].search.take() else {
+            return;
+        };
+        if self.search_owner == Some(tab_id) {
+            if let Some(handle) = self.search_handle.take() {
+                handle.abort();
+            }
+            self.search_owner = None;
+        }
+        let tab = &mut self.state.tabs[index];
+        tab.entries = search.previous_entries;
+        tab.cursor = search.previous_cursor;
+        tab.filter = search.previous_filter;
+        tab.loading = false;
+        tab.error = None;
+        self.state.set_status(StatusLevel::Info, "search cleared");
+        self.refresh_view();
+    }
+
+    fn abort_search_for_tab(&mut self, tab_id: u64) {
+        if self.search_owner != Some(tab_id) {
+            return;
+        }
+        if let Some(handle) = self.search_handle.take() {
+            handle.abort();
+        }
+        self.search_owner = None;
+        self.search_id = self.search_id.wrapping_add(1);
+        let invalid_id = self.search_id;
+        if let Some(index) = self.state.tab_index(tab_id)
+            && let Some(search) = self.state.tabs[index].search.as_mut()
+        {
+            search.id = invalid_id;
+            search.loading = false;
+        }
+    }
+
+    fn abort_directory_load(&mut self) {
+        self.load_retries = 0;
+        if let Some((owner, _)) = self.state.load_state.take()
+            && let Some(index) = self.state.tab_index(owner)
+        {
+            self.state.tabs[index].loading = false;
+        }
+        if let Some(handle) = self.load_handle.take() {
+            handle.abort();
+        }
+    }
+
+    fn apply_search_update(&mut self, update: SearchUpdate) {
+        let (tab_id, search_id) = match &update {
+            SearchUpdate::Entry {
+                tab_id, search_id, ..
+            }
+            | SearchUpdate::Finished { tab_id, search_id }
+            | SearchUpdate::Failed {
+                tab_id, search_id, ..
+            }
+            | SearchUpdate::Notice {
+                tab_id, search_id, ..
+            } => (*tab_id, *search_id),
+        };
+        let Some(index) = self.state.tab_index(tab_id) else {
+            return;
+        };
+        if !self.state.tabs[index]
+            .search
+            .as_ref()
+            .is_some_and(|search| search.id == search_id)
+        {
+            return;
+        }
+
+        match update {
+            SearchUpdate::Entry { entry, .. } => {
+                self.state.tabs[index].entries.push(entry);
+                if let Some(search) = self.state.tabs[index].search.as_mut() {
+                    search.matches += 1;
+                }
+                self.dirty = true;
+            }
+            SearchUpdate::Finished { .. } => {
+                let query = self.state.tabs[index]
+                    .search
+                    .as_ref()
+                    .map(|search| search.query.clone())
+                    .unwrap_or_default();
+                if let Some(search) = self.state.tabs[index].search.as_mut() {
+                    search.loading = false;
+                }
+                let settings = self.state.settings;
+                {
+                    let tab = &mut self.state.tabs[index];
+                    sort_entries(&mut tab.entries, settings.sort);
+                    tab.clamp_cursor(&settings);
+                }
+                if self.search_owner == Some(tab_id) {
+                    self.search_handle = None;
+                    self.search_owner = None;
+                }
+                if index == self.state.active {
+                    self.refresh_view();
+                    self.state.set_status(
+                        StatusLevel::Info,
+                        format!(
+                            "{} results for {query}",
+                            self.state.tabs[index].entries.len()
+                        ),
+                    );
+                }
+                self.dirty = true;
+            }
+            SearchUpdate::Failed { error, .. } => {
+                if let Some(search) = self.state.tabs[index].search.as_mut() {
+                    search.loading = false;
+                    search.error = Some(error.clone());
+                }
+                if self.search_owner == Some(tab_id) {
+                    if let Some(handle) = self.search_handle.take() {
+                        handle.abort();
+                    }
+                    self.search_owner = None;
+                }
+                if index == self.state.active {
+                    self.state.set_status(StatusLevel::Error, error);
+                }
+                self.dirty = true;
+            }
+            SearchUpdate::Notice { text, .. } => {
+                if index == self.state.active {
+                    self.state.set_status(StatusLevel::Info, text);
+                }
+                self.dirty = true;
+            }
         }
     }
 
@@ -1034,13 +1411,14 @@ impl App {
     fn open_tab(&mut self) {
         self.state.open_tab();
         let path = self.state.tab().path.clone();
-        self.state.pending_keys.clear();
+        self.clear_pending();
         self.invalidate_preview();
         self.start_load(path, None);
         self.dirty = true;
     }
 
     fn close_tab(&mut self) {
+        let closed_id = self.state.tab().id;
         if !self.state.close_active_tab() {
             self.state
                 .set_status(StatusLevel::Info, "cannot close the last tab");
@@ -1049,7 +1427,8 @@ impl App {
         }
 
         self.pending_select = None;
-        self.state.pending_keys.clear();
+        self.abort_search_for_tab(closed_id);
+        self.clear_pending();
         self.invalidate_preview();
         let needs_load = {
             let tab = self.state.tab();
@@ -1070,12 +1449,10 @@ impl App {
             return;
         }
 
-        if let Some(handle) = self.load_handle.take() {
-            handle.abort();
-        }
+        self.abort_directory_load();
         self.pending_select = None;
         self.state.active = index;
-        self.state.pending_keys.clear();
+        self.clear_pending();
         self.invalidate_preview();
 
         if self.state.tab().loading {
@@ -1110,8 +1487,9 @@ impl App {
 
         let vfs = Arc::clone(&self.vfs);
         let tx = self.parent_tx.clone();
+        let settings = self.state.settings;
         self.parent_handle = Some(tokio::spawn(async move {
-            let (entries, error) = match load_directory_preview(vfs, &parent_path).await {
+            let (entries, error) = match load_directory_preview(vfs, &parent_path, settings).await {
                 Preview::Directory { entries, .. } => (entries, None),
                 Preview::Error(error) => (Vec::new(), Some(error)),
                 _ => (Vec::new(), None),
@@ -1148,8 +1526,9 @@ impl App {
 
         let vfs = Arc::clone(&self.vfs);
         let tx = self.preview_tx.clone();
+        let settings = self.state.settings;
         self.preview_handle = Some(tokio::spawn(async move {
-            let content = load_preview(vfs, entry).await;
+            let content = load_preview(vfs, entry, settings).await;
             let _ = tx.send(PreviewUpdate { id, content }).await;
         }));
     }
@@ -1173,9 +1552,17 @@ impl App {
     }
 }
 
-async fn send_notice(tx: &mpsc::Sender<DirUpdate>, level: StatusLevel, text: impl Into<String>) {
+async fn send_notice(
+    tx: &mpsc::Sender<DirUpdate>,
+    tab_id: u64,
+    load_id: u64,
+    level: StatusLevel,
+    text: impl Into<String>,
+) {
     let _ = tx
         .send(DirUpdate::Notice {
+            tab_id,
+            load_id,
             level,
             text: text.into(),
         })
@@ -1217,16 +1604,7 @@ async fn stream_dir(
                             return;
                         }
                     }
-                    Err(error) => {
-                        let _ = tx
-                            .send(DirUpdate::Failed {
-                                tab_id,
-                                load_id,
-                                error: error.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
+                    Err(_) => continue,
                 }
             }
             let _ = tx.send(DirUpdate::Finished { tab_id, load_id }).await;
@@ -1243,36 +1621,107 @@ async fn stream_dir(
     }
 }
 
+async fn walk_search(
+    vfs: Arc<dyn Vfs>,
+    tx: mpsc::Sender<SearchUpdate>,
+    root: VPath,
+    query: String,
+    tab_id: u64,
+    search_id: u64,
+) {
+    let needle = query.to_lowercase();
+    let root_dir = root.clone();
+    let mut stack = vec![root];
+    let mut visited = HashSet::new();
+
+    while let Some(dir) = stack.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let mut stream = match vfs.read_dir(&dir).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                if dir == root_dir {
+                    let _ = tx
+                        .send(SearchUpdate::Failed {
+                            tab_id,
+                            search_id,
+                            error: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                let _ = tx
+                    .send(SearchUpdate::Notice {
+                        tab_id,
+                        search_id,
+                        text: format!("skipped {}: {error}", dir.display()),
+                    })
+                    .await;
+                continue;
+            }
+        };
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(raw) => {
+                    let entry = Entry::from(raw);
+                    if entry.name.to_lowercase().contains(&needle)
+                        && tx
+                            .send(SearchUpdate::Entry {
+                                tab_id,
+                                search_id,
+                                entry: entry.clone(),
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                    if entry.kind == EntryKind::Dir && !entry.is_symlink {
+                        stack.push(entry.path.clone());
+                    }
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(SearchUpdate::Notice {
+                            tab_id,
+                            search_id,
+                            text: format!("skipped entry: {error}"),
+                        })
+                        .await;
+                }
+            }
+        }
+    }
+
+    let _ = tx.send(SearchUpdate::Finished { tab_id, search_id }).await;
+}
+
 fn validate_name(name: &str) -> std::result::Result<String, &'static str> {
     let name = name.trim();
     if name.is_empty() {
         return Err("a name is required");
     }
-    let path = std::path::Path::new(name);
-    if path.file_name().is_none() {
-        return Err("invalid name");
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err("name must stay inside the current directory");
-            }
-        }
+    if name == "." || name == ".." || name.chars().any(|ch| ch.is_control() || is_separator(ch)) {
+        return Err("name must be a single file name");
     }
     Ok(name.to_string())
 }
 
-async fn load_preview(vfs: Arc<dyn Vfs>, entry: Entry) -> Preview {
+fn is_separator(ch: char) -> bool {
+    matches!(ch, '/' | '\\')
+}
+
+async fn load_preview(vfs: Arc<dyn Vfs>, entry: Entry, settings: Settings) -> Preview {
     match entry.kind {
-        hwe_vfs::EntryKind::Dir => load_directory_preview(vfs, &entry.path).await,
+        hwe_vfs::EntryKind::Dir => load_directory_preview(vfs, &entry.path, settings).await,
         hwe_vfs::EntryKind::File => load_text_preview(vfs, &entry).await,
         hwe_vfs::EntryKind::Other => Preview::Other,
     }
 }
 
-async fn load_directory_preview(vfs: Arc<dyn Vfs>, path: &VPath) -> Preview {
+async fn load_directory_preview(vfs: Arc<dyn Vfs>, path: &VPath, settings: Settings) -> Preview {
     let mut stream = match vfs.read_dir(path).await {
         Ok(stream) => stream,
         Err(error) => return Preview::Error(error.to_string()),
@@ -1282,13 +1731,14 @@ async fn load_directory_preview(vfs: Arc<dyn Vfs>, path: &VPath) -> Preview {
     while entries.len() < MAX_PREVIEW_ENTRIES {
         match stream.next().await {
             Some(Ok(item)) => entries.push(Entry::from(item)),
-            Some(Err(error)) => return Preview::Error(error.to_string()),
+            Some(Err(_)) => continue,
             None => break,
         }
     }
 
     let truncated = entries.len() == MAX_PREVIEW_ENTRIES && stream.next().await.is_some();
-    sort_entries(&mut entries, SortSettings::default());
+    entries.retain(|entry| settings.show_hidden || !entry.is_hidden);
+    sort_entries(&mut entries, settings.sort);
     Preview::Directory { entries, truncated }
 }
 
@@ -1309,7 +1759,7 @@ async fn load_text_preview(vfs: Arc<dyn Vfs>, entry: &Entry) -> Preview {
         bytes.truncate(MAX_PREVIEW_BYTES as usize);
     }
 
-    if bytes.contains(&0) {
+    if looks_binary(&bytes) {
         return Preview::Binary { size: entry.size };
     }
 
@@ -1325,6 +1775,17 @@ async fn load_text_preview(vfs: Arc<dyn Vfs>, entry: &Entry) -> Preview {
     let truncated = truncated_by_bytes || truncated_by_lines;
 
     Preview::Text { lines, truncated }
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.contains(&0) {
+        return true;
+    }
+    let controls = bytes
+        .iter()
+        .filter(|&&byte| byte.is_ascii_control() && !matches!(byte, b'\t' | b'\n' | b'\r' | 0x0c))
+        .count();
+    controls.saturating_mul(20) > bytes.len()
 }
 
 fn sanitize_line(line: &str) -> String {
@@ -1347,7 +1808,10 @@ mod tests {
 
     use hwe_vfs::{EntryKind, LocalFs, VPath};
 
-    use super::{App, Renderer, load_preview, mpsc, validate_name};
+    use super::{
+        App, Renderer, SearchUpdate, load_directory_preview, load_preview, looks_binary, mpsc,
+        validate_name,
+    };
     use crate::event::AppEvent;
     use crate::keymap::Key;
     use crate::state::{AppState, Entry, Preview, Settings};
@@ -1477,12 +1941,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chained_searches_restore_the_original_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"a").unwrap();
+        std::fs::write(dir.path().join("stale.txt"), b"stale").unwrap();
+        let original = preview_entry(&path);
+        let stale = preview_entry(&dir.path().join("stale.txt"));
+        let (_, event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::new(LocalFs::new()),
+            VPath::new(dir.path()),
+            event_rx,
+            Settings::default(),
+        );
+        app.state.tab_mut().entries = vec![original.clone()];
+        app.state.tab_mut().loading = false;
+
+        app.start_search("a".into());
+        let old_id = app.state.tab().search.as_ref().expect("search").id;
+        app.start_search("stale".into());
+        assert_ne!(old_id, app.state.tab().search.as_ref().expect("search").id);
+
+        app.apply_search_update(SearchUpdate::Entry {
+            tab_id: app.state.tab().id,
+            search_id: old_id,
+            entry: stale,
+        });
+        assert!(app.state.tab().entries.is_empty());
+
+        app.clear_search();
+        assert_eq!(app.state.tab().entries.len(), 1);
+        assert_eq!(app.state.tab().entries[0].name, "a.txt");
+        assert!(app.state.tab().search.is_none());
+    }
+
+    #[tokio::test]
+    async fn starting_search_during_a_load_does_not_stay_loading() {
+        let (_, event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::new(LocalFs::new()),
+            VPath::new("/tmp"),
+            event_rx,
+            Settings::default(),
+        );
+        let tab_id = app.state.tab().id;
+        app.state.tab_mut().loading = true;
+        app.state.load_state = Some((tab_id, 7));
+
+        app.start_search("note".into());
+
+        assert!(!app.state.tab().loading);
+        assert!(app.state.load_state.is_none());
+        assert!(app.state.tab().search.as_ref().expect("search").loading);
+    }
+
+    #[tokio::test]
     async fn previews_text_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("note.txt");
         std::fs::write(&path, b"hello\nworld\n").unwrap();
 
-        let preview = load_preview(Arc::new(LocalFs::new()), preview_entry(&path)).await;
+        let preview = load_preview(
+            Arc::new(LocalFs::new()),
+            preview_entry(&path),
+            Settings::default(),
+        )
+        .await;
         match preview {
             Preview::Text { lines, truncated } => {
                 assert_eq!(lines, vec!["hello".to_string(), "world".to_string()]);
@@ -1498,7 +2023,12 @@ mod tests {
         let path = dir.path().join("blob.bin");
         std::fs::write(&path, b"abc\0def").unwrap();
 
-        let preview = load_preview(Arc::new(LocalFs::new()), preview_entry(&path)).await;
+        let preview = load_preview(
+            Arc::new(LocalFs::new()),
+            preview_entry(&path),
+            Settings::default(),
+        )
+        .await;
         match preview {
             Preview::Binary { size } => assert_eq!(size, Some(7)),
             other => panic!("unexpected preview: {other:?}"),
@@ -1513,7 +2043,12 @@ mod tests {
         std::fs::write(sub.join("inner.txt"), b"x").unwrap();
         std::fs::write(sub.join("aaa.txt"), b"y").unwrap();
 
-        let preview = load_preview(Arc::new(LocalFs::new()), preview_entry(&sub)).await;
+        let preview = load_preview(
+            Arc::new(LocalFs::new()),
+            preview_entry(&sub),
+            Settings::default(),
+        )
+        .await;
         match preview {
             Preview::Directory { entries, truncated } => {
                 let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
@@ -1522,5 +2057,207 @@ mod tests {
             }
             other => panic!("unexpected preview: {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_names_must_be_single_components() {
+        assert_eq!(validate_name("note.txt"), Ok("note.txt".to_string()));
+        for invalid in ["sub/note.txt", "sub\\note.txt", "a\nb", ".", ".."] {
+            assert!(validate_name(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn binary_preview_detects_non_text_bytes() {
+        assert!(looks_binary(&[0x41, 0x00, 0x42]));
+        assert!(looks_binary(&[0x01, 0x02, 0x03, 0x04, 0x41]));
+        assert!(!looks_binary(b"hello\nworld\t!\n"));
+    }
+
+    #[tokio::test]
+    async fn directory_preview_honors_hidden_setting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("visible.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join(".hidden"), b"y").unwrap();
+
+        let preview = load_directory_preview(
+            Arc::new(LocalFs::new()),
+            &VPath::new(dir.path()),
+            Settings::default(),
+        )
+        .await;
+        let entries = match preview {
+            Preview::Directory { entries, .. } => entries,
+            other => panic!("unexpected preview: {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "visible.txt");
+
+        let settings = Settings {
+            show_hidden: true,
+            ..Settings::default()
+        };
+        let preview =
+            load_directory_preview(Arc::new(LocalFs::new()), &VPath::new(dir.path()), settings)
+                .await;
+        let entries = match preview {
+            Preview::Directory { entries, .. } => entries,
+            other => panic!("unexpected preview: {other:?}"),
+        };
+        assert_eq!(entries.len(), 2);
+    }
+
+    struct ScriptedRenderer {
+        events: mpsc::UnboundedSender<AppEvent>,
+        frames: Arc<Mutex<Vec<Vec<String>>>>,
+        started: bool,
+        frames_after_start: usize,
+        quit_sent: bool,
+    }
+
+    impl Renderer for ScriptedRenderer {
+        fn draw(&mut self, state: &AppState) -> io::Result<()> {
+            let names: Vec<String> = state
+                .visible_entries()
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            self.frames.lock().unwrap().push(names.clone());
+
+            if !self.started && !state.tab().loading && !names.is_empty() {
+                self.started = true;
+                let _ = self.events.send(AppEvent::Key(Key::Char('r')));
+                for _ in 0..5 {
+                    let _ = self.events.send(AppEvent::Key(Key::Backspace));
+                }
+                for ch in "b.txt".chars() {
+                    let _ = self.events.send(AppEvent::Key(Key::Char(ch)));
+                }
+                let _ = self.events.send(AppEvent::Key(Key::Enter));
+            } else if self.started && !state.tab().loading {
+                self.frames_after_start += 1;
+                if !self.quit_sent && self.frames_after_start >= 2 {
+                    self.quit_sent = true;
+                    let _ = self.events.send(AppEvent::Key(Key::Char('q')));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_rename_restores_the_directory_listing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut renderer = ScriptedRenderer {
+            events,
+            frames: Arc::clone(&frames),
+            started: false,
+            frames_after_start: 0,
+            quit_sent: false,
+        };
+        let app = App::new(
+            Arc::new(LocalFs::new()),
+            VPath::new(dir.path()),
+            event_rx,
+            Settings::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.run(&mut renderer))
+            .await
+            .expect("app should quit")
+            .expect("event loop");
+
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|names| names == &["a.txt".to_string(), "b.txt".to_string()]),
+            "directory listing should be restored after a failed rename: {frames:?}"
+        );
+    }
+
+    struct SearchRenderer {
+        events: mpsc::UnboundedSender<AppEvent>,
+        frames: Arc<Mutex<Vec<Vec<String>>>>,
+        started: bool,
+        quit_sent: bool,
+    }
+
+    impl Renderer for SearchRenderer {
+        fn draw(&mut self, state: &AppState) -> io::Result<()> {
+            let names: Vec<String> = state
+                .visible_entries()
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            self.frames.lock().unwrap().push(names.clone());
+
+            if !self.started && !state.tab().loading && !names.is_empty() {
+                self.started = true;
+                let _ = self.events.send(AppEvent::Key(Key::ctrl('/')));
+                for ch in "txt".chars() {
+                    let _ = self.events.send(AppEvent::Key(Key::Char(ch)));
+                }
+                let _ = self.events.send(AppEvent::Key(Key::Enter));
+            } else if self.started
+                && !self.quit_sent
+                && state
+                    .tab()
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| !search.loading)
+                && names.iter().any(|name| name == "nested.txt")
+            {
+                self.quit_sent = true;
+                let _ = self.events.send(AppEvent::Key(Key::Esc));
+                let _ = self.events.send(AppEvent::Key(Key::Char('q')));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_search_finds_nested_matches_and_clears() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), b"note").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/nested.txt"), b"nested").unwrap();
+
+        let (events, event_rx) = mpsc::unbounded_channel();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut renderer = SearchRenderer {
+            events,
+            frames: Arc::clone(&frames),
+            started: false,
+            quit_sent: false,
+        };
+        let app = App::new(
+            Arc::new(LocalFs::new()),
+            VPath::new(dir.path()),
+            event_rx,
+            Settings::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), app.run(&mut renderer))
+            .await
+            .expect("app should quit")
+            .expect("event loop");
+
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames
+                .iter()
+                .any(|names| names.iter().any(|name| name == "nested.txt")),
+            "recursive search should include nested matches: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|names| names.as_slice() == ["sub", "note.txt"]),
+            "clearing search should restore the original listing: {frames:?}"
+        );
     }
 }

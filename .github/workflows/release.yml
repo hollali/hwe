@@ -2,52 +2,87 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v[0-9]+.*"
+    tags: ["v*"]
 
 permissions:
   contents: read
 
 jobs:
-  create-release:
-    name: Create release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  upload-assets:
+  build:
     name: Build ${{ matrix.target }}
-    needs: create-release
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            exe: ""
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15-intel
+            exe: ""
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
+            exe: ""
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            exe: ".exe"
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          bin: fm
-          package: hwe
-          target: ${{ matrix.target }}
-          archive: fm-${{ matrix.target }}
-          locked: true
-          checksum: sha256
-          include: README.md LICENSE-MIT LICENSE-APACHE
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-${{ matrix.target }}-
+      - name: Build and package
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          cargo build --release --locked -p hwe
+          archive="fm-${TAG}-${TARGET}"
+          mkdir -p "dist/${archive}"
+          cp "target/release/fm${EXE}" "dist/${archive}/fm${EXE}"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${archive}/"
+          tar czf "dist/${archive}.tar.gz" -C dist "${archive}"
+          rm -rf "dist/${archive}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: sha256sum dist/*.tar.gz > dist/SHA256SUMS
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --verify-tag \
+              --title "fm $TAG" \
+              --notes "Release $TAG"
+          fi
